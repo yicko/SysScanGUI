@@ -4,6 +4,8 @@
 ![Python](https://img.shields.io/badge/python-3.9%2B-3776AB)
 ![UI](https://img.shields.io/badge/UI-PySide6%20(Qt%206)-41CD52)
 ![License](https://img.shields.io/badge/license-MIT-green)
+[![Release](https://img.shields.io/github/v/release/yicko/SysScanGUI?display_name=tag&sort=semver)](https://github.com/yicko/SysScanGUI/releases/latest)
+[![Release Build](https://github.com/yicko/SysScanGUI/actions/workflows/release.yml/badge.svg)](https://github.com/yicko/SysScanGUI/actions/workflows/release.yml)
 
 一个面向 Windows 的**本机安全自检工具**：完整枚举进程、服务、网络连接与持久化项，用一套可解释的规则给出风险等级，并允许你在同一个界面里直接完成处置（结束进程、停用服务、删除启动项……）以及事后恢复。
 
@@ -17,6 +19,7 @@
 - [功能特性](#功能特性)
 - [工作原理](#工作原理)
 - [风险等级](#风险等级)
+- [下载](#下载)
 - [环境要求](#环境要求)
 - [安装](#安装)
 - [使用方法](#使用方法)
@@ -24,6 +27,7 @@
   - [命令行扫描](#2-命令行扫描)
   - [打包为单文件可执行程序](#3-打包为单文件可执行程序可选)
   - [运行回归测试](#4-运行回归测试)
+- [发布新版本](#发布新版本维护者)
 - [目录结构](#目录结构)
 - [设计取舍](#设计取舍)
 - [已知局限](#已知局限)
@@ -117,7 +121,28 @@ Windows 自带的任务管理器只告诉你"有什么在跑"，却很少回答"
 
 > 单实例守卫（`single_instance.py`）是本项目唯一做了跨平台处理的模块；程序其余部分为 Windows 专用。
 
+## 下载
+
+不想装 Python 的话，直接取预编译版本：
+
+| 文件 | 说明 |
+|---|---|
+| [`SysScanGUI.exe`](https://github.com/yicko/SysScanGUI/releases/latest) | 单文件绿色版，约 21.6 MiB，**无需安装 Python**，双击即用 |
+| `SHA256SUMS.txt` | 同页提供的校验和 |
+
+核对下载完整性：
+
+```powershell
+Get-FileHash .\SysScanGUI.exe -Algorithm SHA256
+# 或
+certutil -hashfile SysScanGUI.exe SHA256
+```
+
+> exe 未做代码签名，首次运行可能触发 SmartScreen 提示，点「更多信息 → 仍要运行」即可。
+
 ## 安装
+
+从源码运行需要自行准备 Python 环境：
 
 ```bash
 git clone https://github.com/yicko/SysScanGUI.git
@@ -201,6 +226,26 @@ python check_frozen_single.py  # 打包后 exe 的单实例行为
 
 脚本会打印逐条断言结果与通过计数。部分涉及提权或冻结 exe 的测试需要管理员权限。
 
+## 发布新版本（维护者）
+
+Release 由 GitHub Actions 在云端编译，**不需要在本地打包再上传**：
+
+```bash
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+推送 `v*` 形式的 tag 即触发 [`.github/workflows/release.yml`](.github/workflows/release.yml)，在 `windows-latest` 上依次执行：
+
+1. 按**锁定版本**安装依赖（PySide6-Essentials / PyInstaller，与本地验证过的版本一致，避免剔除规则因版本漂移失效）；
+2. 用 `SysScanGUI.spec` 打包；
+3. **体积护栏**——产物若超过 30 MiB 直接失败，防止在剔除规则失效时把膨胀包发出去；
+4. **冒烟测试**——真的启动一次 exe 并等一次硬件采样落地，失败则不发布；
+5. 生成 `SHA256SUMS.txt`，用 `gh` CLI 创建 Release 并上传资产（幂等：同一 tag 重跑会更新说明并覆盖资产）。
+
+也可以在 Actions 页面手动触发并填一个已存在的 tag，用于重新构建同一版本。工作流不使用任何第三方 Action，
+只用 GitHub 官方的 `actions/*` 与预装的 `gh` CLI。
+
 ## 目录结构
 
 ```
@@ -223,6 +268,9 @@ sysscan/
 ├── check_frozen_scan.py    # │
 ├── check_frozen_elevate.py # │
 ├── check_frozen_single.py  # ┘
+├── .github/
+│   └── workflows/
+│       └── release.yml     # GitHub Actions：推送 v* tag 即自动编译并发布 Release
 ├── README.md
 ├── LICENSE
 └── .gitignore

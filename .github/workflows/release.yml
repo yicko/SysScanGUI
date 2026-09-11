@@ -1,0 +1,231 @@
+name: Release
+
+# 触发方式：
+#   1) 推送形如 v1.0.0 的 tag  → 自动编译并发布对应 Release
+#   2) 手动触发（Actions → Release → Run workflow）→ 需填一个已存在的 tag，
+#      用于「重新构建 / 重发同一版本」（幂等，会覆盖已有资产）
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布或重建的 tag（例如 v1.0.0）'
+        required: true
+        type: string
+
+# 创建 Release 需要 contents: write（GITHUB_TOKEN 默认权限为只读）
+permissions:
+  contents: write
+
+# 同一 tag 的重复触发只保留最新一次，避免并发写同一个 Release
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: 编译并发布 Windows 可执行文件
+    runs-on: windows-latest
+
+    env:
+      # push tag 时取 tag 名；手动触发时取输入的 tag
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      # 与本地验证过并通过 check_frozen_scan.py 的版本严格对齐。
+      # 升级任一版本后必须重跑冻结回归测试，否则 SysScanGUI.spec 的剔除规则可能失效。
+      PYINSTALLER_VERSION: '6.22.2'
+      HOOKS_CONTRIB_VERSION: '2026.7'
+      PYSIDE_VERSION: '6.11.2'
+      PSUTIL_VERSION: '7.2.2'
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 1
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: 安装构建依赖（版本锁定）
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install `
+            "psutil==$env:PSUTIL_VERSION" `
+            "PySide6-Essentials==$env:PYSIDE_VERSION" `
+            "pyinstaller==$env:PYINSTALLER_VERSION" `
+            "pyinstaller-hooks-contrib==$env:HOOKS_CONTRIB_VERSION"
+
+      - name: 编译（PyInstaller onefile）
+        run: python -m PyInstaller --noconfirm --clean SysScanGUI.spec
+
+      - name: 校验产物存在性与体积
+        shell: pwsh
+        run: |
+          $exe = 'dist\SysScanGUI.exe'
+          if (-not (Test-Path $exe)) { throw "编译未产出 $exe" }
+          $size = (Get-Item $exe).Length
+          $mib = $size / 1MB
+          Write-Host ("SysScanGUI.exe = {0:N0} 字节（{1:N2} MiB）" -f $size, $mib)
+          # 体积回归护栏：未优化包约 39 MiB，剔除后约 21.6 MiB。
+          # 一旦剔除规则失效导致体积明显回升，应当直接失败，而不是发布一个膨胀的包。
+          if ($mib -gt 30) { throw ("体积异常：{0:N2} MiB > 30 MiB，SysScanGUI.spec 的剔除规则可能已失效" -f $mib) }
+          if ($mib -lt 10) { throw ("体积异常：{0:N2} MiB < 10 MiB，产物可能不完整" -f $mib) }
+
+      - name: 冒烟测试（冻结 exe 实际启动一次）
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'dist\SysScanGUI.exe').Path
+          $ok = $false
+          foreach ($attempt in 1..2) {
+            if ($attempt -eq 2) {
+              # 兜底：CI 无交互桌面时改用 offscreen 平台插件。
+              # 这一步只验证「进程能起来、采样链路能跑通」，不涉及渲染效果。
+              $env:QT_QPA_PLATFORM = 'offscreen'
+              Write-Host '第 2 次尝试：QT_QPA_PLATFORM=offscreen'
+            }
+            Remove-Item -Force -ErrorAction SilentlyContinue smoke_result.json
+            $p = Start-Process -FilePath $exe -ArgumentList '--smoke' -PassThru
+            if (-not $p.WaitForExit(90000)) {
+              $p.Kill()
+              Write-Host "第 $attempt 次尝试超时（90s），已终止进程"
+              continue
+            }
+            Write-Host "第 $attempt 次尝试退出码 = $($p.ExitCode)"
+            if ($p.ExitCode -eq 0 -and (Test-Path smoke_result.json)) {
+              Write-Host '--- smoke_result.json ---'
+              Get-Content smoke_result.json -Raw
+              $ok = $true
+              break
+            }
+          }
+          if (-not $ok) { throw '冒烟测试失败：--smoke 未正常退出或未产出 smoke_result.json' }
+
+      - name: 生成 SHA256 校验和
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash 'dist\SysScanGUI.exe' -Algorithm SHA256).Hash.ToLower()
+          # 用 LF 换行写标准格式，便于 GNU coreutils 的 sha256sum -c 直接校验
+          [IO.File]::WriteAllText(
+            (Join-Path $PWD 'SHA256SUMS.txt'),
+            "$hash  SysScanGUI.exe`n",
+            (New-Object Text.UTF8Encoding $false)
+          )
+          Get-Content SHA256SUMS.txt
+
+      - name: 发布 Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = $env:RELEASE_TAG
+          $date = (Get-Date).ToString('yyyy-MM-dd')
+
+          $notes = @'
+          ## SysScanGUI {TAG}
+
+          Windows 系统进程与服务安全扫描器——完整枚举进程、服务、网络连接与持久化项，
+          按一套可解释的规则给出风险等级，并可在界面内直接处置与回滚。
+          **程序不联网，不上传任何数据。**
+
+          ### 运行要求
+
+          - Windows 10 / 11（64 位）
+          - **无需安装 Python**，双击 `SysScanGUI.exe` 即可运行
+          - 普通权限可用；以管理员身份运行可获得更完整的服务与进程信息
+
+          ### 下载
+
+          | 文件 | 说明 |
+          |---|---|
+          | `SysScanGUI.exe` | 单文件绿色版，约 21.6 MiB，即下即用 |
+          | `SHA256SUMS.txt` | 校验和 |
+
+          校验下载完整性：
+
+          ```powershell
+          Get-FileHash .\SysScanGUI.exe -Algorithm SHA256
+          # 或
+          certutil -hashfile SysScanGUI.exe SHA256
+          ```
+
+          结果应与 `SHA256SUMS.txt` 中的值一致。
+
+          ### 本版包含
+
+          - 进程 / 服务 / 网络连接 / 计划任务 / 启动项全量采集，含数字签名、运行身份、父进程、命令行
+          - 可解释的风险规则：路径可信度分级、系统进程名伪装、LOLBAS 命令行特征、服务与网络专项检查
+          - 六视图图形界面，支持关键字搜索、风险等级过滤、**点击列标题排序**
+          - 实时硬件指标：CPU / 内存 / GPU 使用率、显存占用、CPU 温度、GPU 温度
+          - 分层自动刷新：概览指标常刷 + 连接轻刷（可选）+ 处置后自动核实
+          - 处置与回滚：结束进程、停用/禁用服务、删除计划任务与启动项，每步留操作历史
+          - 单实例保护：同一时间只允许一个实例运行
+          - 导出 JSON / HTML / CSV 报告
+
+          ### 已知限制
+
+          - **exe 未做代码签名**，首次运行可能触发 SmartScreen 提示（点「更多信息 → 仍要运行」）
+          - GPU 温度在多数集成显卡机器上不可用；CPU 温度在未运行 LibreHardwareMonitor 时取自 ACPI 热区，
+            界面会如实标注来源——**拿不到的数据一律显示 `—`，不会填假数字**
+          - 扫描结果为启发式判定，存在误报与漏报，仅供排查参考，**不能替代专业安全软件的实时防护**
+          - 处置动作（结束进程 / 停用服务 / 删除启动项）具有破坏性，请先确认目标可以安全处置
+
+          完整文档见仓库 [README](https://github.com/yicko/SysScanGUI#readme)。
+
+          ---
+
+          构建信息：由 GitHub Actions 在 `windows-latest` 上编译，Python 3.11，
+          PySide6-Essentials {PYSIDE} + PyInstaller {PYI}。构建日期 {DATE}。
+
+          **免责声明**：本工具会执行终止进程、停止/禁用服务等破坏性操作，作者不对因使用本工具
+          造成的任何数据丢失或系统损坏承担责任，请自行评估风险。
+          '@
+          # 去掉 YAML 块缩进在 here-string 里留下的 10 个前导空格
+          $notes = ($notes -split "`n" | ForEach-Object { $_.TrimStart(' ') }) -join "`n"
+          $notes = $notes.Replace('{TAG}', $tag)
+          $notes = $notes.Replace('{PYSIDE}', $env:PYSIDE_VERSION)
+          $notes = $notes.Replace('{PYI}', $env:PYINSTALLER_VERSION)
+          $notes = $notes.Replace('{DATE}', $date)
+          [IO.File]::WriteAllText((Join-Path $PWD 'release_notes.md'), $notes, (New-Object Text.UTF8Encoding $false))
+
+          $assets = @('dist\SysScanGUI.exe', 'SHA256SUMS.txt')
+
+          # 幂等：已存在的 Release 改为更新说明 + 覆盖资产（支持手动重跑同一 tag）
+          gh release view $tag --json tagName 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag 已存在 → 更新说明并覆盖资产"
+            gh release edit $tag --title "SysScanGUI $tag" --notes-file release_notes.md
+            if ($LASTEXITCODE -ne 0) { throw 'gh release edit 失败' }
+            gh release upload $tag @assets --clobber
+          } else {
+            Write-Host "创建 Release $tag"
+            gh release create $tag --title "SysScanGUI $tag" --notes-file release_notes.md @assets
+          }
+          if ($LASTEXITCODE -ne 0) { throw '发布 Release 失败' }
+
+          gh release view $tag
+
+      - name: 汇总
+        shell: pwsh
+        run: |
+          $size = (Get-Item 'dist\SysScanGUI.exe').Length / 1MB
+          $hash = (Get-Content 'SHA256SUMS.txt').Split(' ')[0]
+          $lines = @(
+            "### Release $env:RELEASE_TAG",
+            "",
+            "- 产物：``SysScanGUI.exe``（{0:N2} MiB）" -f $size,
+            "- SHA256：``$hash``",
+            "- 运行环境：windows-latest / Python 3.11 / PySide6-Essentials $env:PYSIDE_VERSION",
+            "- 页面：https://github.com/${{ github.repository }}/releases/tag/$env:RELEASE_TAG"
+          )
+          [IO.File]::AppendAllText(
+            $env:GITHUB_STEP_SUMMARY,
+            ($lines -join "`n") + "`n",
+            (New-Object Text.UTF8Encoding $false)
+          )

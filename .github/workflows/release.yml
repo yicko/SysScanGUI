@@ -81,7 +81,15 @@ jobs:
       - name: 冒烟测试（冻结 exe 实际启动一次）
         shell: pwsh
         run: |
-          $exe = (Resolve-Path 'dist\SysScanGUI.exe').Path
+          $exeDir = (Resolve-Path 'dist').Path
+          $exe = Join-Path $exeDir 'SysScanGUI.exe'
+          # 注意：冻结后 gui.py 的 HERE = exe 所在目录（而非当前工作目录），
+          # 所以 --smoke 把结果写在 dist\smoke_result.json。两个位置都查，
+          # 避免因为「文件其实写了、只是找错地方」而误报失败。
+          $candidates = @(
+            (Join-Path $PWD 'smoke_result.json'),
+            (Join-Path $exeDir 'smoke_result.json')
+          )
           $ok = $false
           foreach ($attempt in 1..2) {
             if ($attempt -eq 2) {
@@ -90,7 +98,8 @@ jobs:
               $env:QT_QPA_PLATFORM = 'offscreen'
               Write-Host '第 2 次尝试：QT_QPA_PLATFORM=offscreen'
             }
-            Remove-Item -Force -ErrorAction SilentlyContinue smoke_result.json
+            $candidates | ForEach-Object { Remove-Item -Force -ErrorAction SilentlyContinue $_ }
+
             $p = Start-Process -FilePath $exe -ArgumentList '--smoke' -PassThru
             if (-not $p.WaitForExit(90000)) {
               $p.Kill()
@@ -98,14 +107,30 @@ jobs:
               continue
             }
             Write-Host "第 $attempt 次尝试退出码 = $($p.ExitCode)"
-            if ($p.ExitCode -eq 0 -and (Test-Path smoke_result.json)) {
-              Write-Host '--- smoke_result.json ---'
-              Get-Content smoke_result.json -Raw
-              $ok = $true
-              break
+
+            $hit = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if ($p.ExitCode -ne 0) { Write-Host '退出码非 0，判定失败'; continue }
+            if (-not $hit) { Write-Host '未找到 smoke_result.json，判定失败'; continue }
+
+            Write-Host "--- 冒烟结果（$hit）---"
+            Get-Content $hit -Raw
+            try {
+              $json = Get-Content $hit -Raw | ConvertFrom-Json
+            } catch {
+              Write-Host "结果不是合法 JSON：$_"
+              continue
             }
+            # 结果必须是「真采到了数据」，不能是个空壳
+            if (-not $json.rows) { Write-Host '结果缺少 rows 字段'; continue }
+            $rowCount = ($json.rows.PSObject.Properties | Measure-Object).Count
+            if ($rowCount -lt 5) { Write-Host "rows 只有 $rowCount 类，数据不完整"; continue }
+            Write-Host ("指标：cpu={0}% mem={1}% gpu={2}% cpu_temp={3} gpu_temp={4}" -f `
+              $json.cpu_pct, $json.mem_pct, $json.gpu_util, $json.cpu_temp_c, $json.gpu_temp_c)
+            $ok = $true
+            break
           }
-          if (-not $ok) { throw '冒烟测试失败：--smoke 未正常退出或未产出 smoke_result.json' }
+          $candidates | ForEach-Object { Remove-Item -Force -ErrorAction SilentlyContinue $_ }
+          if (-not $ok) { throw '冒烟测试失败：--smoke 未正常退出，或未产出完整有效的 smoke_result.json' }
 
       - name: 生成 SHA256 校验和
         shell: pwsh

@@ -20,6 +20,7 @@
 - [工作原理](#工作原理)
 - [风险等级](#风险等级)
 - [下载](#下载)
+  - [代码签名与来源验证](#代码签名与来源验证)
 - [环境要求](#环境要求)
 - [安装](#安装)
 - [使用方法](#使用方法)
@@ -28,6 +29,7 @@
   - [打包为单文件可执行程序](#3-打包为单文件可执行程序可选)
   - [运行回归测试](#4-运行回归测试)
 - [发布新版本](#发布新版本维护者)
+  - [启用代码签名](#启用代码签名维护者)
 - [目录结构](#目录结构)
 - [设计取舍](#设计取舍)
 - [已知局限](#已知局限)
@@ -138,7 +140,23 @@ Get-FileHash .\SysScanGUI.exe -Algorithm SHA256
 certutil -hashfile SysScanGUI.exe SHA256
 ```
 
-> exe 未做代码签名，首次运行可能触发 SmartScreen 提示，点「更多信息 → 仍要运行」即可。
+### 代码签名与来源验证
+
+**当前发布的 exe 仍是未签名状态**——签名流程已就绪，待证书申请通过后启用（详见[启用代码签名](#启用代码签名维护者)）。在那之前首次运行可能触发 SmartScreen 提示，点「更多信息 → 仍要运行」即可。
+
+无论是否已签名，**每次发布都值得核对产物来源**。发布流程会为 exe 生成 GitHub 构建溯源证明（build provenance attestation），可用 GitHub CLI 验证这个 exe 确实由本仓库的 CI 在 `windows-latest` 上编译、中途未被替换：
+
+```bash
+gh attestation verify SysScanGUI.exe --repo yicko/SysScanGUI
+```
+
+签名启用后，还可用以下命令查看签署者与时间戳（签署者将显示为 `SignPath Foundation`——开源计划的证书以其名义签发，私钥保存在其 HSM 内）：
+
+```powershell
+Get-AuthenticodeSignature .\SysScanGUI.exe | Format-List Status, SignerCertificate, TimeStamperCertificate
+```
+
+有一点需要说清楚：**签名不等于首次下载零提示**。SmartScreen 的信誉来自「文件哈希 + 发布者证书」的下载历史累积，新证书与每个新版本都要重新积累，通常需要数周与数百次干净下载才会消退。签名真正解决的是「未知发布者」标签，以及让信誉能够跨版本累积。
 
 ## 安装
 
@@ -240,11 +258,29 @@ git push origin v1.0.1
 1. 按**锁定版本**安装依赖（PySide6-Essentials / PyInstaller，与本地验证过的版本一致，避免剔除规则因版本漂移失效）；
 2. 用 `SysScanGUI.spec` 打包；
 3. **体积护栏**——产物若超过 30 MiB 直接失败，防止在剔除规则失效时把膨胀包发出去；
-4. **冒烟测试**——真的启动一次 exe 并等一次硬件采样落地，失败则不发布；
-5. 生成 `SHA256SUMS.txt`，用 `gh` CLI 创建 Release 并上传资产（幂等：同一 tag 重跑会更新说明并覆盖资产）。
+4. **代码签名**（未配置时整组步骤自动跳过，见下）；
+5. **冒烟测试**——真的启动一次 exe 并等一次硬件采样落地，失败则不发布。它排在签名之后，因此同时验证了签名没有破坏 exe 本身；
+6. **构建溯源证明**——为产物生成 attestation，供用户核对来源；
+7. 生成 `SHA256SUMS.txt`，用 `gh` CLI 创建 Release 并上传资产（幂等：同一 tag 重跑会更新说明并覆盖资产）。
 
-也可以在 Actions 页面手动触发并填一个已存在的 tag，用于重新构建同一版本。工作流不使用任何第三方 Action，
-只用 GitHub 官方的 `actions/*` 与预装的 `gh` CLI。
+也可以在 Actions 页面手动触发并填一个已存在的 tag，用于重新构建同一版本。工作流除代码签名用的 `signpath/*` 外，只用 GitHub 官方的 `actions/*` 与预装的 `gh` CLI。
+
+### 启用代码签名（维护者）
+
+签名默认不启用。在仓库 Settings → Secrets and variables → Actions 配好以下四项后，下一次推送 `v*` tag 产出的即为已签名 exe：
+
+| 类型 | 名称 | 说明 |
+|---|---|---|
+| Secret | `SIGNPATH_API_TOKEN` | SignPath REST API 令牌（Submitter 权限） |
+| Secret | `SIGNPATH_ORGANIZATION_ID` | SignPath 组织 ID |
+| Variable | `SIGNPATH_PROJECT_SLUG` | 项目标识；**它是否非空即代码签名的总开关** |
+| Variable | `SIGNPATH_SIGNING_POLICY_SLUG` | 签名策略标识，通常为 `release-signing` |
+
+只配了一部分时，工作流会在「核对签名配置完整性」一步直接失败，而不是静默产出未签名包——避免误以为已经签上。
+
+签名流程为：上传待签名产物 → 提交签名请求并取回已签名产物 → 替换 `dist` 下的编译产物 → 用 `Get-AuthenticodeSignature` 断言签名有效且带 RFC 3161 时间戳。
+
+> **顺序约束**：签名会改变文件字节，因此「提交签名并替换产物」必须排在生成 `SHA256SUMS.txt` 之前，否则发布的校验和会与线上产物对不上。签名完成后也不得再对 exe 做任何改动。
 
 ## 目录结构
 
@@ -294,7 +330,8 @@ sysscan/
 - **CPU 温度**在未运行 LibreHardwareMonitor 时来自 ACPI 热区，读数是主板/机身热区温度（通常长期稳定不动），界面会如实标注来源。
 - **集显显存总量**无法获得（动态共享系统内存），只报告占用绝对值。
 - 部分受保护进程的信息（路径、命令行）在非管理员权限下会缺失，属系统限制。
-- 打包后的 exe 未签名，首次运行可能触发 SmartScreen。
+- 打包后的 exe **当前未签名**（签名流程已就绪，待证书申请通过后启用），首次运行可能触发 SmartScreen 提示。
+- 签名只解决「未知发布者」与信誉累积问题，**不会让首次下载立即零提示**——SmartScreen 信誉需要靠下载历史逐步建立。
 - 扫描结果为启发式判定，**存在误报与漏报**，仅供排查参考，不能替代专业安全软件的实时防护。
 
 ## 安全与隐私
@@ -303,6 +340,7 @@ sysscan/
 - **扫描结果只落本地磁盘。** JSON 与 HTML 报告默认生成在程序目录下。
 - 本仓库**不包含任何扫描结果**：`scan_result.json` 与 `report.html` 已被 `.gitignore` 排除。这类文件会记录主机名、账户名、完整进程命令行与远端 IP 地址，属于个人隐私数据。
 - 提交问题（Issue）时请勿直接粘贴完整扫描结果，建议先脱敏主机名、账户名与 IP。
+- **产物来源可验证。** 每次发布都附 `SHA256SUMS.txt` 与 GitHub 构建溯源证明，可核对产物是否确实由本仓库的 CI 编译、中途未被替换（见[代码签名与来源验证](#代码签名与来源验证)）。
 
 ## 免责声明
 

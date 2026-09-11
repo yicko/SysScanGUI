@@ -1,0 +1,27 @@
+# 统一换行符处理，避免不同平台协作时出现整文件级别的 diff 噪音。
+#
+# 特别说明 *.bat：cmd.exe 无法正确解析 LF-only 的批处理文件
+# （`if (...)` 块与 goto 标签会失效），所以工作区必须检出为 CRLF。
+
+* text=auto
+
+*.py    text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.spec  text eol=lf
+LICENSE text eol=lf
+.gitignore    text eol=lf
+.gitattributes text eol=lf
+
+# 批处理必须 CRLF
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# 二进制
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.exe   binary
+*.dll   binary
+*.zip   binary

@@ -115,6 +115,24 @@ def self_process_hint(rec: dict) -> str:
             "这是单文件打包的固定结构，不是旧实例没退出。")
 
 
+def about_text() -> str:
+    """「关于」弹窗的正文（纯函数，便于单独核对文案）。
+
+    只讲用户需要知道的事：能做什么、结果怎么带走、哪些动作要管理员权限、
+    数据去哪了、以及"多开一个会怎样"。**不写实现机制** ——
+    命名互斥体 / 锁文件 / 内核回收这类细节属于 `single_instance.py` 的模块说明，
+    放在面向用户的弹窗里对用户没有任何信息量。
+    """
+    return (f"{APP_ID}（{APP_TITLE}）\n\n"
+            "扫描本机进程 / 服务 / 网络连接 / 持久化项，按可解释的规则给出风险等级。\n"
+            "结果可导出 JSON / HTML / CSV（JSON 与 scan_result.json 格式兼容）。\n"
+            "扫描本身只读；终止进程、管理服务等处置动作需要管理员权限。\n\n"
+            "程序不联网，不上传任何数据。\n"
+            "同一时间只允许运行一个实例，重复启动会把已有窗口切到前台\n"
+            "（查看实例与锁状态：帮助 → 运行实例信息）。\n\n"
+            "开源许可：MIT · github.com/yicko/SysScanGUI")
+
+
 def run_silent(cmd: list[str], timeout: int = 30) -> tuple[int, str]:
     """静默执行外部命令：不弹出任何控制台窗口，返回 (returncode, 输出文本)。"""
     try:
@@ -1141,15 +1159,9 @@ class ScanApp(QMainWindow):
         self.act_live_metrics = act_live
 
         hm = m.addMenu("帮助")
-        hm.addAction("运行实例信息（单实例锁）…", self.show_instance_info)
+        hm.addAction("运行实例信息…", self.show_instance_info)
         hm.addSeparator()
-        hm.addAction("关于", lambda: _info(self, "关于",
-                     f"{APP_TITLE}\n\n"
-                     "扫描本机进程 / 服务 / 网络连接 / 持久化项并给出风险提示。\n"
-                     "数据格式与 scan_result.json 完全兼容，可导入导出。\n"
-                     "修改系统（终止进程/管理服务）需要管理员权限。\n\n"
-                     "单实例运行：命名互斥体 + 锁文件双保险，"
-                     "异常退出后由系统内核自动释放。"))
+        hm.addAction("关于", lambda: _info(self, "关于", about_text()))
 
     def _build_toolbar(self):
         tb = QToolBar("工具栏")

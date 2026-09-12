@@ -190,10 +190,10 @@ python gui.py
 | 查看某条记录详情 | 双击该行 |
 | 排序 | 单击列标题（再点一次切换升降序） |
 | 处置动作 | 右键该行 → 选择动作 |
-| 查看/回滚历史操作 | 菜单 **操作 → 操作历史** |
+| 查看/回滚历史操作 | 菜单 **操作 → 处理历史 / 恢复** |
 | 恢复默认排序 | 工具栏 **恢复默认排序** |
 | 查看指标数据来源 | 菜单 **视图 → 指标数据来源** |
-| 以管理员身份重启 | 菜单 **文件 → 以管理员身份运行** |
+| 以管理员身份重启 | 菜单 **操作 → 以管理员身份重新运行** |
 
 > 程序内建单实例检测。若已有实例在运行，新实例会把已有窗口切到前台并提示占用者信息，然后以退出码 `3` 安全退出。
 
@@ -240,6 +240,7 @@ python check_refresh.py        # 分层自动刷新、操作后核实、单飞�
 python check_elevate.py        # 提权链路（ShellExecuteExW + 启动握手）
 python check_single.py         # 单实例守卫（互斥体、陈旧锁、PID 复用、提示文案）
 python check_selfproc.py       # 自身进程标注（引导器/应用本体识别、不误报、不越权放行）
+python check_ui_text.py        # 文案一致性（「关于」不写实现细节 + README 的菜单指引真实存在）
 python check_frozen_scan.py    # 打包后 exe 的扫描能力
 python check_frozen_elevate.py # 打包后 exe 的提权窗口可见性
 python check_frozen_single.py  # 打包后 exe 的单实例行为
@@ -305,6 +306,7 @@ sysscan/
 ├── check_elevate.py        # │ （各脚本相互独立，按需运行）
 ├── check_single.py         # │
 ├── check_selfproc.py       # │
+├── check_ui_text.py        # │
 ├── check_frozen_scan.py    # │
 ├── check_frozen_elevate.py # │
 ├── check_frozen_single.py  # ┘

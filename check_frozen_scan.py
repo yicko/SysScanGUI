@@ -14,6 +14,8 @@
   2. PowerShell 签名校验子进程通道在冻结环境可用
   3. 计划任务 XML 解析（pyexpat）与注册表读取（winreg）可用
   4. report.build_html 渲染可用
+  5. 单文件版「引导器 + 应用本体」两个自身进程能被正确识别，
+     且扫描结果里它们被标为正常、不产生指向自己的风险项
 """
 import json
 import os
@@ -76,6 +78,41 @@ def main() -> int:
                 print(f"    WARN: {mod} 仍可导入（预期不应存在）")
             except ImportError:
                 print(f"    OK: {mod} 不存在，且前述功能全部正常")
+
+        print("[6] 本程序自身进程组（单文件冻结环境下应为 引导器 + 应用本体）...")
+        group = scan.collect_self_group()
+        for r in group:
+            print(f"    pid={r['pid']} role={r['role']} rss={r['rss_mb']}MB "
+                  f"me={r['is_me']}")
+        me_rows = [r for r in group if r.get("is_me")]
+        boots = [r for r in group if "引导器" in r["role"]]
+        apps = [r for r in group if "应用本体" in r["role"]]
+        if len(me_rows) != 1:
+            print(f"FAIL: 自身进程应恰好 1 个（当前窗口），实际 {len(me_rows)}")
+            return 1
+        if len(group) < 2 or not boots or not apps:
+            print("FAIL: 单文件冻结环境下自身进程组应含「引导器 + 应用本体」两个，"
+                  f"实际 {[(r['pid'], r['role']) for r in group]}")
+            return 1
+        print(f"    OK: 引导器 pid={boots[0]['pid']}，应用本体 pid={apps[0]['pid']}")
+
+        print("[7] 扫描结果里自身进程必须被标注为正常、且不产生风险项 ...")
+        self_procs = [p for p in data["processes"] if p.get("self_process")]
+        for p in self_procs:
+            print(f"    pid={p['pid']} risk={p['risk']} note={p.get('self_note')}")
+        if len(self_procs) < 2:
+            print(f"FAIL: 扫描结果里自身进程应 >= 2（引导器 + 应用本体），"
+                  f"实际 {len(self_procs)}")
+            return 1
+        if any(p["risk"] != "正常" for p in self_procs):
+            print("FAIL: 自身进程被判为非「正常」")
+            return 1
+        self_pids = {f"process:{p['pid']}" for p in self_procs}
+        bad = [f for f in data["findings"] if f.get("target") in self_pids]
+        if bad:
+            print(f"FAIL: 自身进程产生了风险项：{[f['title'] for f in bad]}")
+            return 1
+        print("    OK: 自身进程均标为正常，未产生任何风险项")
 
         print("ALL_CHECKS_PASSED")
         return 0

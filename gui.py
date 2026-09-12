@@ -100,6 +100,21 @@ def release_instance_lock():
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 
+def self_process_hint(rec: dict) -> str:
+    """自身进程的说明文案；不是自身进程则返回空串。
+
+    单文件（PyInstaller onefile）版运行时，进程表里必然有两个同名进程：
+    引导器（解包 + 守护）和应用本体。用户看到两个"本程序进程"时最容易误会成
+    "切到管理员模式后旧实例没退出"，所以在这里把话说明白。
+    """
+    if not rec.get("self_process"):
+        return ""
+    role = rec.get("self_note") or "本程序自身进程"
+    return (f"{role}：单文件（PyInstaller onefile）版运行时会同时存在"
+            "「引导器 + 应用本体」两个同名进程，两者命令行完全相同 —— "
+            "这是单文件打包的固定结构，不是旧实例没退出。")
+
+
 def run_silent(cmd: list[str], timeout: int = 30) -> tuple[int, str]:
     """静默执行外部命令：不弹出任何控制台窗口，返回 (returncode, 输出文本)。"""
     try:
@@ -603,6 +618,15 @@ class DetailDialog(QDialog):
             tv.setItem(row, 0, QTableWidgetItem(k))
             tv.setItem(row, 1, QTableWidgetItem(v if not isinstance(v, (list, dict)) else str(v)))
         lay.addWidget(tv, 1)
+
+        # 本程序自身进程：把"为什么有两个同名进程"说清楚（否则容易被当成旧实例没退出）
+        hint = self_process_hint(rec)
+        if hint:
+            hl = QLabel("• " + hint)
+            hl.setWordWrap(True)
+            hl.setStyleSheet("color:#027a48;")
+            hl.setIndent(12)
+            lay.addWidget(hl)
 
         # 风险原因
         reasons = rec.get("reasons") or []
@@ -2152,13 +2176,34 @@ class ScanApp(QMainWindow):
                                 "已降级继续运行（此时可能出现两个实例）。")
 
     def show_instance_info(self):
-        """查看当前单实例锁状态（排查"为什么说程序已在运行"）。"""
+        """查看当前单实例锁状态（排查"为什么说程序已在运行"）。
+
+        顺带列出本程序自身的进程组：单文件（onefile）版运行时正常会有两个同名
+        进程（引导器 + 应用本体），这是"切到管理员模式后看到两个本程序进程"的
+        真正原因，在这里说清楚，免得被当成旧实例没退出。
+        """
         info_lines = []
+
+        def _append_self_group(lines):
+            group = scan_mod.collect_self_group()
+            if not group:
+                return
+            lines.append("")
+            lines.append(f"本程序自身的进程（共 {len(group)} 个）：")
+            for r in group:
+                lines.append(f"    PID {r['pid']}　{r['role']}　{r['rss_mb']} MB"
+                             + ("　← 当前窗口" if r.get("is_me") else ""))
+            if len(group) > 1:
+                lines.append("    说明：单文件（onefile）版运行时必然同时存在引导器与应用")
+                lines.append("    两个同名进程（命令行完全相同），属正常结构，"
+                             "不是旧实例没退出。")
+
         guard = self._takeover_guard or _GUARD
         if guard is None:
-            _info(self, "运行实例",
-                  "本次启动跳过了单实例检测（--smoke / --allow-multi /"
-                  " SYSSCAN_ALLOW_MULTI），因此没有持锁。")
+            info_lines.append("本次启动跳过了单实例检测（--smoke / --allow-multi /"
+                              " SYSSCAN_ALLOW_MULTI），因此没有持锁。")
+            _append_self_group(info_lines)
+            _info(self, "运行实例信息", "\n".join(info_lines))
             return
         st = guard.status()
         info_lines.append(f"实例标识：{st['key']}")
@@ -2177,6 +2222,7 @@ class ScanApp(QMainWindow):
             info_lines.append("")
             info_lines.append(f"锁文件记录的占用者：{state}")
             info_lines.append(h.describe("    "))
+        _append_self_group(info_lines)
         _info(self, "运行实例信息", "\n".join(info_lines))
 
     # ---------------- 记录管理：新增 / 编辑 / 删除 ----------------
@@ -2592,6 +2638,9 @@ def main():
                 "rows": {k: len(win.data.get(k) or []) for k in TAB_ORDER},
                 "tile_texts": {k: t.value_lbl.text()
                                for k, t in win.metrics_panel.tiles.items()},
+                # 本程序自身的进程组：冻结的单文件 exe 正常情况下应是 2 个
+                # （引导器 + 应用本体），用它能在打包环境下验证这条链路
+                "self_group": scan_mod.collect_self_group(),
             }
             try:
                 with open(os.path.join(HERE, "smoke_result.json"), "w",

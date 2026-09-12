@@ -244,6 +244,96 @@ def is_known_app(name: str | None, path: str | None) -> bool:
     return any(tok in s for tok in KNOWN_APP_TOKENS)
 
 
+# ----------------------------------------------------------------------------
+# 本程序自身的进程
+# ----------------------------------------------------------------------------
+# 单文件（PyInstaller onefile）版本运行时，进程表里会同时出现两个同名进程：
+#   · 引导器：先把自身解包到 %TEMP%\_MEIxxxxxx，再以自己为父进程启动真正的应用，
+#     然后一直守着不退出，为的是应用结束后清理解包目录；
+#   · 应用本体：真正的 Python/Qt 进程。
+# 两者**命令行完全相同**（同一个 --elevated-token），很容易被误认为"旧实例没退出"。
+#
+# 更要紧的是：这类绿色版 exe 通常位于非标准目录且未签名，本工具的规则会把
+# "未签名 + 非标准目录"判成中危 —— 于是它扫自己就会刷出两条指向自己的告警，
+# 纯属噪音。所以把自身进程组识别出来单独标注，并跳过那几条规则。
+
+def self_exe_path() -> str:
+    """本程序自身的可执行文件路径（非冻结环境返回空串）。
+
+    源码运行时 sys.executable 是 python.exe，若按它匹配，会把机器上**所有**
+    Python 进程都当成"自身"——那是错的。所以非冻结环境只靠 pid 匹配本进程。
+    """
+    if getattr(sys, "frozen", False):
+        try:
+            return os.path.abspath(sys.executable)
+        except Exception:
+            return ""
+    return ""
+
+
+SELF_EXE = self_exe_path()
+
+
+def mark_self_processes(procs: list[dict]) -> dict[int, str]:
+    """识别本程序自身的进程，返回 {pid: 角色说明}。
+
+    纯函数（不查系统），便于单测：入参只需 pid / ppid / exe 三个字段。
+    """
+    self_pids: set[int] = set()
+    me = os.getpid()
+    for p in procs:
+        pid = p.get("pid")
+        if not pid:
+            continue
+        if pid == me:
+            self_pids.add(pid)          # 本进程永远算自身（源码运行也成立）
+        elif SELF_EXE and norm(p.get("exe")) == norm(SELF_EXE):
+            self_pids.add(pid)          # 同一个 exe 文件：引导器 / 另一个实例
+    by_pid = {p.get("pid"): p for p in procs}
+    notes: dict[int, str] = {}
+    for pid in self_pids:
+        me_row = by_pid.get(pid) or {}
+        parent = by_pid.get(me_row.get("ppid"))
+        child_is_self = any(c.get("ppid") == pid and c.get("pid") in self_pids
+                            for c in procs)
+        parent_is_self = bool(parent) and parent.get("pid") in self_pids
+        if child_is_self:
+            notes[pid] = "本程序自身进程 · 单文件引导器（解包并守护应用进程）"
+        elif parent_is_self:
+            notes[pid] = "本程序自身进程 · 应用本体"
+        else:
+            notes[pid] = "本程序自身进程"
+    return notes
+
+
+def collect_self_group() -> list[dict]:
+    """当前与本程序相关的进程清单（供界面展示"为什么有两个进程"）。"""
+    me = os.getpid()
+    rows: list[dict] = []
+    try:
+        for p in psutil.process_iter(["pid", "ppid", "name", "exe", "memory_info"]):
+            try:
+                info = p.info
+                if not (info.get("pid") == me
+                        or (SELF_EXE and norm(info.get("exe")) == norm(SELF_EXE))):
+                    continue
+                mem = info.get("memory_info")
+                rows.append({"pid": info.get("pid"),
+                             "ppid": info.get("ppid") or 0,
+                             "name": info.get("name") or "",
+                             "exe": info.get("exe") or "",
+                             "rss_mb": round((mem.rss if mem else 0) / 1048576, 1)})
+            except Exception:
+                continue
+    except Exception:
+        return []
+    notes = mark_self_processes(rows)
+    for r in rows:
+        r["role"] = notes.get(r["pid"], "本程序自身进程")
+        r["is_me"] = r["pid"] == me
+    return sorted(rows, key=lambda r: r["pid"])
+
+
 def ip_is_public(ip: str) -> bool:
     try:
         import ipaddress
@@ -712,6 +802,8 @@ def sev_rank(a: str, b: str) -> str:
 
 def analyze_processes(procs: list[dict], sig: dict[str, dict], F: Findings) -> None:
     pids = {p["pid"] for p in procs}
+    # 本程序自身的进程（单文件版=引导器+应用本体）：只标注，不参与风险判定
+    self_notes = mark_self_processes(procs)
     for p in procs:
         key = f"process:{p['pid']}"
         name_l = p["name"].lower()
@@ -732,6 +824,19 @@ def analyze_processes(procs: list[dict], sig: dict[str, dict], F: Findings) -> N
             p["sig_signer"] = ""
 
         reasons: list[dict] = []
+
+        # 0. 本程序自身的进程：标注为正常并跳过下面的规则。
+        #    单文件版运行时必然存在两个同名进程（引导器 + 应用本体），且绿色版
+        #    通常位于非标准目录又未签名 —— 不跳过就会刷出两条指向自己的中危告警。
+        #    说明：这里连资源占用规则一起跳过；本工具的职责是排查**别的**程序，
+        #    对自己的内存占用报警没有意义（要调性能有专门的观测手段）。
+        if p["pid"] in self_notes:
+            p["self_process"] = True
+            p["self_note"] = self_notes[p["pid"]]
+            p["path_note"] = f"{src_desc}（{self_notes[p['pid']]}）"
+            p["reasons"] = []
+            p["risk"] = "正常"
+            continue
 
         # 1. 高风险目录
         if src == "high":

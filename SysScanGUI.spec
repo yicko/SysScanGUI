@@ -8,6 +8,8 @@
     python -m PyInstaller --noconfirm --clean SysScanGUI.spec
 """
 import os
+import sys
+import tempfile
 
 # --------------------------------------------------------------------------
 # 1. 剔除的 Qt / 第三方二进制（按文件名匹配，统一小写）
@@ -121,11 +123,67 @@ EXCLUDES = [
     "tkinter", "PyQt5", "PyQt6", "matplotlib", "numpy", "PIL",
 ]
 
+# --------------------------------------------------------------------------
+# 4. 版本号注入：让「关于」弹窗、exe 右键属性、Release tag 指向同一个版本
+#    取号逻辑在 app_version.py（可单测）：环境变量 → git describe → DEV_VERSION
+#    CI 通过 SYSSCAN_BUILD_VERSION 显式传入 tag；本地打包则自动读 git。
+#    注入件放在临时目录，不污染源码树。
+# --------------------------------------------------------------------------
+sys.path.insert(0, SPECPATH)
+import app_version as _ver_mod           # noqa: E402
+
+BUILD_VERSION = _ver_mod.resolve_build_version()
+print("[VER] build version = %s" % BUILD_VERSION)
+if BUILD_VERSION == _ver_mod.DEV_VERSION:
+    print("[VER] WARN: no version could be determined (no %s, not a git repo, or "
+          "no tag); the build will report %s"
+          % (_ver_mod.ENV_VAR, _ver_mod.DEV_VERSION))
+
+_ver_dir = tempfile.mkdtemp(prefix="sysscan_ver_")
+
+# 通道 1：随包注入，运行期由 app_version.current() 从 sys._MEIPASS 读回
+_ver_txt = os.path.join(_ver_dir, _ver_mod.INJECT_NAME)
+with open(_ver_txt, "w", encoding="utf-8") as _f:
+    _f.write(BUILD_VERSION)
+
+# 通道 2：Windows 版本资源 —— 右键 exe → 属性 → 详细信息里直接看到版本号。
+# 直接构造 VSVersionInfo 对象传给 EXE（PyInstaller 同时支持传文件路径），
+# 省掉落盘与 eval 往返；中文字符串经 toRaw() 以 UTF-16 写入 PE，无编码风险。
+_verinfo = None
+try:
+    from PyInstaller.utils.win32.versioninfo import (FixedFileInfo, StringFileInfo,
+                                                     StringStruct, StringTable,
+                                                     VarFileInfo, VarStruct,
+                                                     VSVersionInfo)
+    _nums = _ver_mod.version_tuple(BUILD_VERSION)
+    _verinfo = VSVersionInfo(
+        ffi=FixedFileInfo(filevers=_nums, prodvers=_nums, mask=0x3F, flags=0x0,
+                          OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
+        kids=[StringFileInfo([StringTable("080404B0", [
+            StringStruct("CompanyName", "SysScanGUI"),
+            StringStruct("FileDescription", "系统进程与服务安全扫描器"),
+            StringStruct("FileVersion", BUILD_VERSION),
+            StringStruct("InternalName", "SysScanGUI"),
+            StringStruct("LegalCopyright", "MIT License"),
+            StringStruct("OriginalFilename", "SysScanGUI.exe"),
+            StringStruct("ProductName", "SysScanGUI"),
+            StringStruct("ProductVersion", BUILD_VERSION),
+        ])]),
+            VarFileInfo([VarStruct("Translation", [0x0804, 1200])])],
+    )
+    print("[VER] version resource ready (ProductVersion = %s, numeric %s)"
+          % (BUILD_VERSION, _nums))
+except Exception as _e:                    # 版本资源只是加分项，失败不该阻断打包
+    print("[VER] WARN: version resource skipped (%s); exe is still usable" % _e)
+    _verinfo = None
+
 a = Analysis(
     ["gui.py"],
     pathex=[],
     binaries=[],
-    datas=[],
+    # 通道 1：把注入的版本号放进包里。dest 用 "." = 包根目录 —— 这与
+    # a.datas 里 (dest, src, typecode) 三元组的语义不同，别混用。
+    datas=[(_ver_txt, ".")],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -137,6 +195,9 @@ a = Analysis(
 
 a.binaries, _b_cnt, _b_bytes = _filter(a.binaries, keep_binary)
 a.datas, _d_cnt, _d_bytes = _filter(a.datas, keep_data)
+# 自检：注入件必须活过剔除规则并留在最终 datas 里（列表为空 = 注入没生效）
+_inj = [e for e in a.datas if _ver_mod.INJECT_NAME in str(e[0])]
+print("[VER] datas entries = %d, injected = %r" % (len(a.datas), _inj))
 print("[SLIM] dropped binaries %d / %.2f MB, datas %d / %.2f MB, total %.2f MB"
       % (_b_cnt, _b_bytes / 1048576, _d_cnt, _d_bytes / 1048576,
          (_b_bytes + _d_bytes) / 1048576))
@@ -162,4 +223,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    version=_verinfo,       # Windows 版本资源（None = 不写入）
 )

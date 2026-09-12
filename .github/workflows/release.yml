@@ -68,8 +68,17 @@ jobs:
             "pyinstaller==$env:PYINSTALLER_VERSION" `
             "pyinstaller-hooks-contrib==$env:HOOKS_CONTRIB_VERSION"
 
-      - name: 编译（PyInstaller onefile）
-        run: python -m PyInstaller --noconfirm --clean SysScanGUI.spec
+      - name: 编译（PyInstaller onefile，注入 tag 作为版本号）
+        shell: pwsh
+        run: |
+          # 版本号只有一个来源：触发本次构建的 tag。
+          # SysScanGUI.spec 会把它写进包内（_build_version.txt，供「关于」弹窗读取）
+          # 并写进 exe 的版本资源（右键属性 → 详细信息）。
+          # 下面两步会分别断言这两条通道，避免出现"有版本号但永远是 dev"的空壳。
+          $env:SYSSCAN_BUILD_VERSION = $env:RELEASE_TAG.TrimStart('v')
+          if (-not $env:SYSSCAN_BUILD_VERSION) { throw '无法从 tag 推导版本号' }
+          Write-Host "注入版本号：$env:SYSSCAN_BUILD_VERSION"
+          python -m PyInstaller --noconfirm --clean SysScanGUI.spec
 
       - name: 校验产物存在性与体积
         shell: pwsh
@@ -170,6 +179,23 @@ jobs:
           }
           Write-Host '签名校验通过'
 
+      - name: 校验 exe 内嵌版本号与 tag 一致
+        shell: pwsh
+        run: |
+          # 版本号有两条独立通道，缺一条就会出现「界面里有、右键属性里没有」这类半成品：
+          #   1) PE 版本资源（右键 → 属性 → 详细信息）—— 本步骤
+          #   2) 包内注入文件（「关于」弹窗读取）—— 冒烟步骤读 smoke_result.json
+          $expect = $env:RELEASE_TAG.TrimStart('v')
+          $vi = (Get-Item 'dist\SysScanGUI.exe').VersionInfo
+          Write-Host "ProductVersion = $($vi.ProductVersion)"
+          Write-Host "FileVersion    = $($vi.FileVersion)"
+          Write-Host "期望版本号     = $expect"
+          if ($vi.ProductVersion -ne $expect) {
+            throw ("exe 版本资源与 tag 不一致：{0} ≠ {1}（SysScanGUI.spec 的版本注入可能已失效）" -f `
+              $vi.ProductVersion, $expect)
+          }
+          Write-Host '版本资源校验通过'
+
       # =========================================================================
 
       # 放在签名之后：这样它同时验证了「签名没有破坏 exe 本身」
@@ -219,6 +245,14 @@ jobs:
             if (-not $json.rows) { Write-Host '结果缺少 rows 字段'; continue }
             $rowCount = ($json.rows.PSObject.Properties | Measure-Object).Count
             if ($rowCount -lt 5) { Write-Host "rows 只有 $rowCount 类，数据不完整"; continue }
+            # 版本号必须等于本次 tag。这条走「包内注入文件」通道（App 内部读回），
+            # 与上一步的 PE 版本资源互为独立证据：任何一条断了都说明注入没打通。
+            $expectVer = $env:RELEASE_TAG.TrimStart('v')
+            if ($json.version -ne $expectVer) {
+              Write-Host ("版本号不符：包内 = '{0}'，期望 '{1}'" -f $json.version, $expectVer)
+              continue
+            }
+            Write-Host "包内版本号 = $($json.version)"
             Write-Host ("指标：cpu={0}% mem={1}% gpu={2}% cpu_temp={3} gpu_temp={4}" -f `
               $json.cpu_pct, $json.mem_pct, $json.gpu_util, $json.cpu_temp_c, $json.gpu_temp_c)
             $ok = $true

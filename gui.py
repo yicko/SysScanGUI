@@ -49,6 +49,7 @@ if getattr(sys, "frozen", False):
 else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import app_version as version_mod      # noqa: E402
 import metrics as metrics_mod    # noqa: E402
 import report as report_mod      # noqa: E402
 import scan as scan_mod          # noqa: E402
@@ -122,8 +123,12 @@ def about_text() -> str:
     数据去哪了、以及"多开一个会怎样"。**不写实现机制** ——
     命名互斥体 / 锁文件 / 内核回收这类细节属于 `single_instance.py` 的模块说明，
     放在面向用户的弹窗里对用户没有任何信息量。
+
+    版本号取自打包时注入的构建信息（见 app_version.py），报 bug 时按这一行
+    就能对上是哪个 Release。
     """
-    return (f"{APP_ID}（{APP_TITLE}）\n\n"
+    return (f"{APP_ID}（{APP_TITLE}）\n"
+            f"版本 {version_mod.current()}\n\n"
             "扫描本机进程 / 服务 / 网络连接 / 持久化项，按可解释的规则给出风险等级。\n"
             "结果可导出 JSON / HTML / CSV（JSON 与 scan_result.json 格式兼容）。\n"
             "扫描本身只读；终止进程、管理服务等处置动作需要管理员权限。\n\n"
@@ -2640,6 +2645,8 @@ def main():
         def _smoke_report():
             m = win._last_metrics or {}
             payload = {
+                # 构建版本号：打包时注入，CI 用它断言"注进去的版本 == 发布的 tag"
+                "version": version_mod.current(),
                 "cpu_pct": m.get("cpu_pct"), "mem_pct": m.get("mem_pct"),
                 "gpu_util": m.get("gpu_util"),
                 "gpu_mem_used_gb": m.get("gpu_mem_used_gb"),

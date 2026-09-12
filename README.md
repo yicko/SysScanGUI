@@ -226,6 +226,8 @@ python -m PyInstaller --noconfirm --clean SysScanGUI.spec
 
 产物为 `dist/SysScanGUI.exe`。`SysScanGUI.spec` 内含一套**瘦身规则**：剔除运行期不会被加载的 Qt 模块（QtNetwork / QtSvg / QtSql …）、软件 OpenGL 回退实现（`opengl32sw.dll`，约 19.7 MB）、第三方 OpenSSL、96 个未使用的 Qt 翻译包，以及误从 `PATH` 抓进来的系统 API Set DLL。所有剔除项都经过冒烟测试与完整扫描验证。
 
+打包同时会写入**版本号**，来源只有一个：环境变量 `SYSSCAN_BUILD_VERSION`（CI 用它注入 tag），未设置时回退 `git describe` 取最近的 tag。版本号写进两处 —— 包内供「关于」弹窗显示，以及 exe 的版本资源（右键 → 属性 → 详细信息）。源码直接运行时显示 `0.0.0-dev`，**如实区分「官方构建」与「改过的源码」**，不冒充正式版本。
+
 > 打包后的 exe 未做代码签名，首次运行可能触发 SmartScreen 提示。
 
 ### 4. 运行回归测试
@@ -241,6 +243,7 @@ python check_elevate.py        # 提权链路（ShellExecuteExW + 启动握手�
 python check_single.py         # 单实例守卫（互斥体、陈旧锁、PID 复用、提示文案）
 python check_selfproc.py       # 自身进程标注（引导器/应用本体识别、不误报、不越权放行）
 python check_ui_text.py        # 文案一致性（「关于」不写实现细节 + README 的菜单指引真实存在）
+python check_version.py        # 版本号（取号优先级、注入链路、「关于」显示、不冒充正式版本）
 python check_frozen_scan.py    # 打包后 exe 的扫描能力
 python check_frozen_elevate.py # 打包后 exe 的提权窗口可见性
 python check_frozen_single.py  # 打包后 exe 的单实例行为
@@ -260,12 +263,13 @@ git push origin v1.0.1
 推送 `v*` 形式的 tag 即触发 [`.github/workflows/release.yml`](.github/workflows/release.yml)，在 `windows-latest` 上依次执行：
 
 1. 按**锁定版本**安装依赖（PySide6-Essentials / PyInstaller，与本地验证过的版本一致，避免剔除规则因版本漂移失效）；
-2. 用 `SysScanGUI.spec` 打包；
-3. **体积护栏**——产物若超过 30 MiB 直接失败，防止在剔除规则失效时把膨胀包发出去；
-4. **代码签名**（未配置时整组步骤自动跳过，见下）；
-5. **冒烟测试**——真的启动一次 exe 并等一次硬件采样落地，失败则不发布。它排在签名之后，因此同时验证了签名没有破坏 exe 本身；
-6. **构建溯源证明**——为产物生成 attestation，供用户核对来源；
-7. 生成 `SHA256SUMS.txt`，用 `gh` CLI 创建 Release 并上传资产（幂等：同一 tag 重跑会更新说明并覆盖资产）。
+2. 用 `SysScanGUI.spec` 打包，并把**触发本次构建的 tag 作为版本号**注入（CI 经 `SYSSCAN_BUILD_VERSION` 传入，spec 写进包内与 exe 版本资源）；
+3. **版本号自检**——断言 exe 版本资源里的版本等于该 tag，冒烟步骤再断言 exe 启动后从包内读回的版本同样等于该 tag。两条通道互相独立，任何一条断掉都会让流水线失败，而不是发出一个「有版本号但永远是 dev」的包；
+4. **体积护栏**——产物若超过 30 MiB 直接失败，防止在剔除规则失效时把膨胀包发出去；
+5. **代码签名**（未配置时整组步骤自动跳过，见下）；
+6. **冒烟测试**——真的启动一次 exe 并等一次硬件采样落地，失败则不发布。它排在签名之后，因此同时验证了签名没有破坏 exe 本身；
+7. **构建溯源证明**——为产物生成 attestation，供用户核对来源；
+8. 生成 `SHA256SUMS.txt`，用 `gh` CLI 创建 Release 并上传资产（幂等：同一 tag 重跑会更新说明并覆盖资产）。
 
 也可以在 Actions 页面手动触发并填一个已存在的 tag，用于重新构建同一版本。工作流除代码签名用的 `signpath/*` 外，只用 GitHub 官方的 `actions/*` 与预装的 `gh` CLI。
 
@@ -295,6 +299,7 @@ sysscan/
 ├── gui.py                  # PySide6 图形界面主程序（入口）
 ├── metrics.py              # 实时硬件指标采样（ctypes 直连 PDH，零子进程）
 ├── single_instance.py      # 单实例守卫（命名互斥体 + 锁文件双保险）
+├── app_version.py          # 构建版本号（环境变量 → git tag → dev，可单测）
 ├── SysScanGUI.spec         # PyInstaller 打包配置（含体积瘦身规则）
 ├── requirements.txt        # 运行期依赖
 ├── run_gui.bat             # 启动图形界面
@@ -307,6 +312,7 @@ sysscan/
 ├── check_single.py         # │
 ├── check_selfproc.py       # │
 ├── check_ui_text.py        # │
+├── check_version.py        # │
 ├── check_frozen_scan.py    # │
 ├── check_frozen_elevate.py # │
 ├── check_frozen_single.py  # ┘

@@ -45,6 +45,9 @@ _shot_*.png
 _shot_*.py
 _elevate_tmp/
 *.log
+# --smoke 自检写出的结果文件（CI 会断言其内容，本地跑完即弃）
+smoke_result.json
+smoke_result*.json
 
 # ---------------------------------------------------------------------------
 # 6. WorkBuddy 本地工作记忆（含开发者本机绝对路径，不上传）

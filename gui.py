@@ -54,6 +54,7 @@ import metrics as metrics_mod    # noqa: E402
 import report as report_mod      # noqa: E402
 import scan as scan_mod          # noqa: E402
 import single_instance as single_mod   # noqa: E402
+import eventlog_widget as evw_mod       # noqa: E402  系统事件日志查看/分析模块
 
 APP_TITLE = "系统进程与服务安全扫描器"
 DEFAULT_JSON = os.path.join(HERE, "scan_result.json")
@@ -1294,6 +1295,12 @@ class ScanApp(QMainWindow):
             self.trees[tab] = table
             self.nb.addTab(page, spec["title"])
 
+        # 系统日志模块：独立标签页，复用同一窗口。它有自己的筛选/分页/分析/后台线程，
+        # 与上方 5 个扫描数据页完全解耦（不读写 self.data，也不参与新增/编辑/导出 CSV）。
+        # 置于末尾以尽量不扰动既有页签顺序；_tab_at() 保证它不会污染现有页的索引逻辑。
+        self.eventlog_panel = evw_mod.EventLogPanel(self)
+        self.nb.addTab(self.eventlog_panel, "系统日志")
+
     def _build_statusbar(self):
         sb = QStatusBar()
         self.setStatusBar(sb)
@@ -2252,7 +2259,7 @@ class ScanApp(QMainWindow):
             rec.setdefault("severity", "提示")
 
     def add_record(self):
-        tab = TAB_ORDER[self.nb.currentIndex() - 1] if self.nb.currentIndex() > 0 else None
+        tab = self._tab_at(self.nb.currentIndex())
         if tab not in NEW_FIELDS:
             _info(self, "提示", "请先切换到要新增记录的数据页（进程/服务/连接/持久化/风险清单）。")
             return
@@ -2360,7 +2367,7 @@ class ScanApp(QMainWindow):
             _error(self, "导出失败", friendly(exc))
 
     def export_csv(self):
-        tab = TAB_ORDER[self.nb.currentIndex() - 1] if self.nb.currentIndex() > 0 else None
+        tab = self._tab_at(self.nb.currentIndex())
         if tab not in TAB_DEFS:
             _info(self, "提示", "请先切换到要导出的数据页。")
             return
@@ -2390,8 +2397,18 @@ class ScanApp(QMainWindow):
     # ---------------- 排序 ----------------
 
     def _current_tab(self) -> str | None:
-        i = self.nb.currentIndex()
-        return TAB_ORDER[i - 1] if i > 0 else None
+        return self._tab_at(self.nb.currentIndex())
+
+    def _tab_at(self, i: int) -> str | None:
+        """把页签下标安全地映射回扫描数据页 key。
+
+        概述页(0)与新增的「系统日志」页（下标 = len(TAB_ORDER)+1）不属于扫描数据页，
+        返回 None——这样新增标签页不会把索引错位地映射到某个旧数据页（否则会出现
+        “在系统日志页点新增记录，却改到 findings 页” 之类的串味 bug）。
+        """
+        if i <= 0 or i > len(TAB_ORDER):
+            return None
+        return TAB_ORDER[i - 1]
 
     def reset_sort_current(self):
         tab = self._current_tab()

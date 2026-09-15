@@ -83,11 +83,25 @@ Windows 自带的任务管理器只告诉你"有什么在跑"，却很少回答"
 - **单实例保护**：同一时间只允许一个实例，避免多个实例互相覆盖扫描结果或重复执行处置动作。
 - **自身进程识别**：单文件版运行时会出现「引导器 + 应用本体」两个同名进程，程序会把它们标注为
   「本程序自身进程」并跳过风险判定，不会把自己的进程报成「未签名程序运行于非标准目录」。
+- **系统事件日志查看与分析**：独立「系统日志」标签页，覆盖 Application / System / Security 等常用通道；
+  支持按时间范围、级别（信息/警告/错误/严重）、事件 ID、来源与关键字筛选并分页浏览，可展开查看单条
+  详情；统计各级别数量与占比、按事件 ID / 来源 / 时间段聚合，识别高频错误与异常趋势并以柱状图呈现；
+  读取在后台线程进行，界面不阻塞。
 
 ### 报告输出
 
 - **JSON**：完整结构化数据，便于二次加工。
 - **HTML**：单文件、零外部依赖，内嵌标签页、搜索框与等级过滤，可直接发给别人或归档。
+
+### 系统事件日志
+
+新增的「系统日志」模块采用与扫描器一致的分层结构，且完全独立——不读写 `scan_result.json`、不参与既有五个数据页的新增/编辑/导出，因此不会影响现有模块：
+
+- **数据读取层（`eventlog_reader.py`）**：用 `ctypes` 直接调用 `wevtapi.dll`（`EvtQuery` / `EvtNext` / `EvtRender`），零额外依赖、零子进程（与 `metrics.py` 走 PDH 的思路一致）。级别 / 时间 / 事件 ID / 来源 通过 XPath 在服务端筛选（快、省内存），关键字等自由文本在已取回数据上做客户端即时筛选。读取在后台线程分批进行（增量加载），不会卡住界面；另设整体超时上限与取消开关。
+- **分析统计层（`eventlog_stats.py`）**：纯函数，对取回的记录做级别数量与占比、按事件 ID / 来源 / 时间段的聚合，识别高频错误与异常趋势。
+- **界面展示层（`eventlog_widget.py`）**：筛选控件、分页表格、详情对话框、QPainter 柱状图（不引入 QtCharts，保持打包精简）、刷新与导出（CSV / JSON）。
+
+异常场景都有明确提示：读取 Security 通道需要「管理审核与安全日志」特权（提示以管理员重新运行）、日志服务不可用、日志为空、读取超时（整体超时后停止并提示缩小范围）。
 
 ## 工作原理
 
@@ -244,6 +258,7 @@ python check_single.py         # 单实例守卫（互斥体、陈旧锁、PID �
 python check_selfproc.py       # 自身进程标注（引导器/应用本体识别、不误报、不越权放行）
 python check_ui_text.py        # 文案一致性（「关于」不写实现细节 + README 的菜单指引真实存在）
 python check_version.py        # 版本号（取号优先级、注入链路、「关于」显示、不冒充正式版本）
+python check_eventlog.py        # 系统日志模块（XPath 构造、XML 解析、统计聚合、面板分页/筛选/导出、标签页索引隔离）
 python check_frozen_scan.py    # 打包后 exe 的扫描能力
 python check_frozen_elevate.py # 打包后 exe 的提权窗口可见性
 python check_frozen_single.py  # 打包后 exe 的单实例行为
@@ -300,6 +315,9 @@ sysscan/
 ├── metrics.py              # 实时硬件指标采样（ctypes 直连 PDH，零子进程）
 ├── single_instance.py      # 单实例守卫（命名互斥体 + 锁文件双保险）
 ├── app_version.py          # 构建版本号（环境变量 → git tag → dev，可单测）
+├── eventlog_reader.py      # 系统日志·数据读取层（ctypes 调 wevtapi，XPath 服务端筛选）
+├── eventlog_stats.py       # 系统日志·分析统计层（级别/事件ID/来源/时间聚合，纯函数）
+├── eventlog_widget.py      # 系统日志·界面展示层（筛选/分页/详情/图表/导出/后台线程）
 ├── SysScanGUI.spec         # PyInstaller 打包配置（含体积瘦身规则）
 ├── requirements.txt        # 运行期依赖
 ├── run_gui.bat             # 启动图形界面
@@ -313,6 +331,7 @@ sysscan/
 ├── check_selfproc.py       # │
 ├── check_ui_text.py        # │
 ├── check_version.py        # │
+├── check_eventlog.py       # │
 ├── check_frozen_scan.py    # │
 ├── check_frozen_elevate.py # │
 ├── check_frozen_single.py  # ┘

@@ -268,7 +268,10 @@ python report.py --json scan_result.json --out report.html
 ### 3. 打包为单文件可执行程序（可选）
 
 ```bash
-pip install pyinstaller
+# 推荐：用 build_local.py，它会自动挑出「签名有效」的 python.org 解释器再打包
+python build_local.py
+
+# 等价的原始命令（注意解释器必须是 python.org 官方版，原因见下）
 python -m PyInstaller --noconfirm --clean SysScanGUI.spec
 ```
 
@@ -276,7 +279,30 @@ python -m PyInstaller --noconfirm --clean SysScanGUI.spec
 
 打包同时会写入**版本号**，来源只有一个：环境变量 `SYSSCAN_BUILD_VERSION`（CI 用它注入 tag），未设置时回退 `git describe` 取最近的 tag。版本号写进两处 —— 包内供「关于」弹窗显示，以及 exe 的版本资源（右键 → 属性 → 详细信息）。源码直接运行时显示 `0.0.0-dev`，**如实区分「官方构建」与「改过的源码」**，不冒充正式版本。
 
-> 打包后的 exe 未做代码签名，首次运行可能触发 SmartScreen 提示。
+#### 本地打包的产物被 Smart App Control 拦了？换对解释器就行
+
+Windows 11 的**智能应用控制（Smart App Control，SAC）**在强制模式下会直接阻止未签名的 exe，
+报 `OSError [WinError 4551] 应用程序控制策略已阻止此文件`，而且**没有「仍要运行」按钮**；
+换目录、换文件名都无效（判定依据是文件内容，不是路径）。
+
+实测根因**不在打包方式，而在用的是哪一版 Python 解释器**（同机同源码，唯一变量即此）：
+
+| 构建用解释器 | 其运行时二进制的签名 | 产物能否运行 |
+| --- | --- | --- |
+| python.org 官方版（3.11 x64） | ✅ Python Software Foundation 已签名 | ✅ 正常 |
+| python-build-standalone（`uv`、各类「便携版」默认拉取的发行版） | ❌ 未签名 | ❌ 被 SAC 阻止 |
+
+原理：单文件包会把 Python 运行时（`python3.dll` / `python3XX.dll`）打进 exe。python.org 版由 PSF
+做了 Authenticode 签名，standalone 发行版则**完全没有签名**；一个应用里只要混入未签名组件，
+SAC 就会把整个应用判为不可信。CI 侧由 `actions/setup-python` 安装 python.org 版，
+所以官方 Release **一直都能正常双击运行** —— 这也是「CI 产物能跑、自己打的跑不了」的原因。
+
+`build_local.py` 就是为这个坑准备的：它扫描本机解释器、只挑**签名有效**的那个来构建，
+找不到就直接报错退出，而不是默默产出一个跑不起来的 exe。`python build_local.py --list`
+可以先看一眼本机各解释器的签名状态。
+
+> ⚠️ 打包后的 exe 未做代码签名。在 SAC 强制模式的机器上，**只有**用已签名解释器构建才能放行；
+> 首次运行仍可能触发 SmartScreen 提示。要彻底解决对外分发的问题，需要正式代码签名（见[启用代码签名](#启用代码签名维护者)）。
 
 ### 4. 运行回归测试
 
@@ -353,6 +379,7 @@ sysscan/
 ├── eventlog_stats.py       # 系统日志·分析统计层（级别/事件ID/来源/时间聚合 + 开机运行时长，纯函数）
 ├── eventlog_widget.py      # 系统日志·界面展示层（筛选/分页/详情/图表/导出/后台线程）
 ├── SysScanGUI.spec         # PyInstaller 打包配置（含体积瘦身规则）
+├── build_local.py          # 本地打包入口（自动选用已签名的 python.org 解释器，绕开 SAC 拦截）
 ├── requirements.txt        # 运行期依赖
 ├── run_gui.bat             # 启动图形界面
 ├── run_scan.bat            # 命令行扫描 + 生成 HTML 报告
@@ -402,6 +429,9 @@ sysscan/
   目录又未签名，会刷出两条指向自己的中危告警）；菜单 **帮助 → 运行实例信息** 里可以看到
   当前这两个进程的 pid 与角色。不想要这个结构的话，只能改用目录式（onedir）打包。
 - 打包后的 exe **当前未签名**（签名流程已就绪，待证书申请通过后启用），首次运行可能触发 SmartScreen 提示。
+- 在启用了**智能应用控制（SAC）**的 Windows 11 上，未签名的 exe 会被**直接阻止，且没有「仍要运行」按钮**。
+  本机实测：只要改用**已签名的 python.org 解释器**打包即可通过（用 `build_local.py`，原因见上文「本地打包的产物被 Smart App Control 拦了？」）；
+  但要彻底解决**对外分发**问题，仍需正式代码签名。
 - 签名只解决「未知发布者」与信誉累积问题，**不会让首次下载立即零提示**——SmartScreen 信誉需要靠下载历史逐步建立。
 - 扫描结果为启发式判定，**存在误报与漏报**，仅供排查参考，不能替代专业安全软件的实时防护。
 

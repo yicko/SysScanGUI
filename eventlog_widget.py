@@ -34,13 +34,14 @@ import json
 from datetime import datetime, timedelta
 
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QDateTime
-from PySide6.QtGui import (QColor, QBrush, QFont, QPainter, QPen, QPalette)
+from PySide6.QtGui import (QColor, QBrush, QFont, QPainter, QPen, QPalette,
+                           QShortcut, QKeySequence)
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
                               QLabel, QLineEdit, QComboBox, QCheckBox, QPushButton,
                               QDateTimeEdit, QTableWidget, QTableWidgetItem,
                               QHeaderView, QAbstractItemView, QSplitter, QTabWidget,
                               QProgressBar, QFrame, QMessageBox, QFileDialog, QDialog,
-                              QTextEdit, QSizePolicy)
+                              QTextEdit, QSizePolicy, QApplication, QMenu)
 
 import eventlog_reader as evr
 import eventlog_stats as evs
@@ -60,6 +61,30 @@ LEVEL_SEVERITY = {"严重": 0, "错误": 1, "警告": 2, "信息": 3, "详细": 
 TIME_PRESETS = ["全部", "近1小时", "近24小时", "近7天", "近30天", "自定义"]
 
 PAGE_SIZE_DEFAULT = 200
+
+# --------------------------------------------------------------------------
+# 布局：日志列表 / 统计区 的分隔与缩放（避免「列表只剩两行、又拖不动」）
+# --------------------------------------------------------------------------
+SPLIT_INIT = (560, 300)          # 分隔条初始尺寸：列表占大头
+LIST_MIN_H = 150                 # 列表最小高度（≈6 行），防止被压到只剩两行
+ANALYSIS_MIN_H = 96              # 统计区最小高度（保住 tab 标题 + 一行图）
+LIST_SORT_HINT = "点击列标题排序 · 双击/右键查看详情"
+LIST_FONT_STEPS = (-2, -1, 0, 1, 2, 4, 6, 8)   # A- / A+ 的字号档位（相对基准磅值）
+
+# 分隔条样式：原样式只有 1px 且无任何视觉提示，用户不知道此处可拖拽
+SPLIT_HANDLE_QSS = """
+QSplitter::handle:vertical {
+    background: #e5e7eb;
+    border-top: 1px solid #d1d5db;
+    border-bottom: 1px solid #d1d5db;
+    height: 9px;
+}
+QSplitter::handle:vertical:hover { background: #bfdbfe; }
+QSplitter::handle:vertical:pressed { background: #93c5fd; }
+"""
+
+BOOT_LINE_QSS = ("color:#175cd3;background:#eef4ff;border:1px solid #c7d7fe;"
+                 "border-radius:4px;padding:4px 8px;")
 
 
 # ==========================================================================
@@ -174,66 +199,163 @@ class BarChartView(QWidget):
 # 单条事件详情对话框
 # ==========================================================================
 class EventDetailDialog(QDialog):
+    """单条事件详情（支持放大查看）。
+
+    布局与交互要点：
+      - 窗口可自由拉伸，并带最大化/最小化按钮与右下角尺寸手柄
+        （原来是固定的 760x560，想放大只能改代码）；
+      - 「字段 / 描述 / 原始 XML」三块由垂直分隔条分隔，任一块都能拖动放大
+        （原来描述被 setMaximumHeight(140) 钉死，长描述只能在小框里滚动）；
+      - A- / A+ 调整正文字号；窗口尺寸在同一会话内记忆，下次打开沿用。
+    """
+
+    _last_size = None            # 类属性：记住上次窗口尺寸（同一会话内）
+
     def __init__(self, parent, rec: dict):
         super().__init__(parent)
         self.setWindowTitle(f"事件详情 · {rec.get('channel', '')}")
-        self.resize(760, 560)
+        self.setWindowFlags(self.windowFlags()
+                            | Qt.WindowType.WindowMaximizeButtonHint
+                            | Qt.WindowType.WindowMinimizeButtonHint)
+        self.setSizeGripEnabled(True)
+        self.setMinimumSize(560, 380)
+        self.resize(EventDetailDialog._last_size or QSize(940, 720))
+        self._font_step = 0
+
         lay = QVBoxLayout(self)
         lay.setSpacing(8)
 
+        # ---- 标题行：[来源]  事件ID xxx  [级别] ----
         head = rec.get("source") or "?"
         eid = rec.get("event_id")
         title = f"{head}" + (f"  事件ID {eid}" if eid is not None else "")
+        hb = QHBoxLayout()
         lbl = QLabel(title)
         f = lbl.font(); f.setBold(True); f.setPointSize(f.pointSize() + 2)
         lbl.setFont(f)
-        lay.addWidget(lbl)
-        if rec.get("level") and rec["level"] != "信息":
+        hb.addWidget(lbl)
+        if rec.get("level"):
             lv = QLabel(f"[{rec['level']}]")
-            lv.setStyleSheet(f"color:{LEVEL_FG.get(rec['level'], '#333')};font-weight:bold;")
-            # 放到标题右侧
-            hb = QHBoxLayout(); hb.addWidget(lbl); hb.addWidget(lv); hb.addStretch(1)
-            lay.addLayout(hb)
+            lv.setStyleSheet(
+                f"color:{LEVEL_FG.get(rec['level'], '#333')};font-weight:bold;")
+            hb.addWidget(lv)
+        hb.addStretch(1)
+        lay.addLayout(hb)
 
-        tv = QTableWidget(0, 2)
-        tv.setHorizontalHeaderLabels(["字段", "值"])
-        tv.verticalHeader().setVisible(False)
-        tv.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        tv.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        tv.setColumnWidth(0, 120)
-        tv.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        for k in ("time", "level", "event_id", "source", "channel",
-                  "computer", "record_id", "keywords"):
-            v = rec.get(k, "")
+        # ---- 三块内容放进垂直分隔条：可各自拖大，互不挤压 ----
+        sp = QSplitter(Qt.Orientation.Vertical)
+        sp.setHandleWidth(9)
+        sp.setChildrenCollapsible(False)
+        sp.setStyleSheet(SPLIT_HANDLE_QSS)
+
+        self.fields = QTableWidget(0, 2)
+        self.fields.setHorizontalHeaderLabels(["字段", "值"])
+        self.fields.verticalHeader().setVisible(False)
+        self.fields.setMinimumHeight(90)
+        self.fields.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Fixed)
+        self.fields.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch)
+        self.fields.setColumnWidth(0, 120)
+        self.fields.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        rows: list[tuple[str, object]] = [("时间", rec.get("time", "")),
+                                          ("级别", rec.get("level", ""))]
+        # 开机类事件（6013/6005/12/13…）补一行「事件含义」：把
+        # 「参数5 = 7586」这种原始字段翻译成「系统已运行 7586 秒（≈2 小时 6 分）」
+        btext = evs.boot_kind_text(rec)
+        if btext:
+            rows.append(("事件含义", btext))
+        rows += [("事件ID", rec.get("event_id")),
+                 ("来源", rec.get("source", "")),
+                 ("通道", rec.get("channel", "")),
+                 ("计算机", rec.get("computer", "")),
+                 ("记录ID", rec.get("record_id")),
+                 ("关键字", rec.get("keywords", ""))]
+        for k, v in rows:
             if v in (None, ""):
                 continue
-            row = tv.rowCount(); tv.insertRow(row)
-            tv.setItem(row, 0, QTableWidgetItem(str(k)))
-            tv.setItem(row, 1, QTableWidgetItem(str(v)))
-        lay.addWidget(tv)
+            r = self.fields.rowCount(); self.fields.insertRow(r)
+            self.fields.setItem(r, 0, QTableWidgetItem(str(k)))
+            self.fields.setItem(r, 1, QTableWidgetItem(str(v)))
+        sp.addWidget(self._titled("字段：", self.fields))
 
-        lay.addWidget(QLabel("描述："))
-        desc = QTextEdit()
-        desc.setReadOnly(True)
-        desc.setPlainText(rec.get("description", ""))
-        desc.setMaximumHeight(140)
-        lay.addWidget(desc)
+        self.desc = QTextEdit()
+        self.desc.setReadOnly(True)
+        self.desc.setPlainText(rec.get("description", ""))
+        self.desc.setMinimumHeight(80)
+        sp.addWidget(self._titled("描述（可拖动上方分隔条放大）：", self.desc))
 
-        lay.addWidget(QLabel("原始 XML："))
-        xml = QTextEdit()
-        xml.setReadOnly(True)
-        xml.setPlainText(rec.get("xml", ""))
-        lay.addWidget(xml, 1)
+        self.xml = QTextEdit()
+        self.xml.setReadOnly(True)
+        self.xml.setPlainText(rec.get("xml", ""))
+        self.xml.setMinimumHeight(80)
+        sp.addWidget(self._titled("原始 XML：", self.xml))
 
+        sp.setStretchFactor(0, 1)
+        sp.setStretchFactor(1, 2)
+        sp.setStretchFactor(2, 3)
+        sp.setSizes([200, 220, 300])
+        lay.addWidget(sp, 1)
+
+        # ---- 底部按钮：字号缩放 + 复制 + 关闭 ----
         btns = QHBoxLayout()
+        self.lbl_zoom = QLabel("正文字号：")
+        self.lbl_zoom.setStyleSheet("color:#6b7280;")
+        btns.addWidget(self.lbl_zoom)
+        for text, step, tip in (("A-", -1, "缩小正文字号（Ctrl+- 亦可）"),
+                                ("A+", 1, "放大正文字号（Ctrl++ 亦可）")):
+            b = QPushButton(text)
+            b.setFixedWidth(34)
+            b.setToolTip(tip)
+            b.clicked.connect(lambda _=False, s=step: self._zoom(s))
+            btns.addWidget(b)
         btns.addStretch(1)
+        copy_desc = QPushButton("复制描述")
+        copy_desc.clicked.connect(lambda: self._copy(self.desc.toPlainText()))
+        btns.addWidget(copy_desc)
         copy = QPushButton("复制 XML")
-        copy.clicked.connect(lambda: self._copy(rec.get("xml", "")))
+        copy.clicked.connect(lambda: self._copy(self.xml.toPlainText()))
         btns.addWidget(copy)
         close = QPushButton("关闭")
         close.clicked.connect(self.accept)
         btns.addWidget(close)
         lay.addLayout(btns)
+
+        self._base_pt = self.fields.font().pointSize()
+        # Ctrl +/- 缩放（与按钮等效，键盘操作更快）
+        for key in ("Ctrl++", "Ctrl+="):
+            sc = QShortcut(QKeySequence(key), self)
+            sc.activated.connect(lambda: self._zoom(1))
+        sc2 = QShortcut(QKeySequence("Ctrl+-"), self)
+        sc2.activated.connect(lambda: self._zoom(-1))
+
+    @staticmethod
+    def _titled(title: str, w: QWidget) -> QWidget:
+        """给分隔条里的一块内容套一个小标题（标题随块一起被压缩/放大）。"""
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(2)
+        lab = QLabel(title)
+        lab.setStyleSheet("color:#6b7280;")
+        v.addWidget(lab)
+        v.addWidget(w, 1)
+        return box
+
+    def _zoom(self, step: int):
+        """调整正文字号（字段表 / 描述 / XML 一起缩放）。"""
+        self._font_step = max(-3, min(8, self._font_step + step))
+        pt = max(6, self._base_pt + self._font_step)
+        for w in (self.fields, self.desc, self.xml):
+            f = w.font(); f.setPointSize(pt); w.setFont(f)
+        self.fields.verticalHeader().setDefaultSectionSize(max(22, int(pt * 1.95)))
+        self.lbl_zoom.setText(f"正文字号 {pt}pt：")
+
+    def done(self, result: int):
+        # 记住用户调整后的窗口尺寸，下次打开直接沿用（最大化时不记，避免被"顶格"）
+        if not self.isMaximized():
+            EventDetailDialog._last_size = self.size()
+        super().done(result)
 
     @staticmethod
     def _copy(text: str):
@@ -263,6 +385,9 @@ class EventLogPanel(QWidget):
         self._loading = False
         self._worker: LogLoadWorker | None = None
         self._loaded_once = False
+        self._analysis_sizes: list[int] | None = None   # 折叠统计区前的分隔比例
+        self._font_step = 0                              # 列表字号档位（A- / A+）
+        self._base_font_pt = 0                           # 由 _build_body 取列表默认字号
 
         # 状态标签必须先于 _build_body 创建（主体布局末尾会引用它）
         self.status = QLabel("点击「查询 / 刷新」加载所选日志通道。")
@@ -357,6 +482,16 @@ class EventLogPanel(QWidget):
         self.btn_reset = QPushButton("重置筛选")
         self.btn_reset.clicked.connect(self._reset_filters)
         row3.addWidget(self.btn_reset)
+
+        # 「开机与运行」：一键切到 System 通道里与开机/关机/运行时长相关的
+        # 事件（6005/6006/6008/6009/6013、Kernel-General 12/13、User32 1074）。
+        # 这些事件平时混在 System 通道几千条日志里，手工填来源+事件ID 很麻烦。
+        self.btn_boot = QPushButton("开机与运行")
+        self.btn_boot.setToolTip(
+            "一键筛选：计算机开机 / 关机 / 已运行时长（System 通道的 "
+            "EventLog 6005/6006/6008/6009/6013、Kernel-General 12/13、User32 1074）")
+        self.btn_boot.clicked.connect(self._preset_boot)
+        row3.addWidget(self.btn_boot)
         self.btn_csv = QPushButton("导出 CSV")
         self.btn_csv.clicked.connect(lambda: self._export("csv"))
         row3.addWidget(self.btn_csv)
@@ -388,6 +523,7 @@ class EventLogPanel(QWidget):
         self._page = 0
         self._fill_page()
         self._update_status()
+        self._update_boot_line()
 
     def _reset_filters(self):
         self.channel_cb.setCurrentIndex(0)
@@ -397,6 +533,23 @@ class EventLogPanel(QWidget):
         self.eid_edit.clear()
         self.src_edit.clear()
         self.kw_edit.clear()
+        self.run_query()
+
+    def _preset_boot(self):
+        """一键切到「开机与运行」视角。
+
+        Windows 把「开机时间 / 已运行时长」写在 System 通道的固定事件里，
+        但它们是「信息」级别、混在数千条日志中，手工填来源+事件ID 很麻烦，
+        这里把筛选条件（来源 / 事件ID / 时间范围）一次填好并立即查询。
+        """
+        self.channel_cb.setCurrentText("System")
+        self._set_levels(True)                    # 开机类事件多为「信息」，级别不能过滤掉
+        self.time_cb.setCurrentText("近30天")
+        self._on_time_preset("近30天")
+        self.src_edit.setText(", ".join(evs.BOOT_FILTER_PROVIDERS))
+        self.eid_edit.setText(", ".join(str(i) for i in evs.BOOT_FILTER_EVENT_IDS))
+        self.kw_edit.clear()
+        self.status.setText("已套用「开机与运行」筛选（System 通道 · 开机/关机/运行时长事件）…")
         self.run_query()
 
     # ---------------- 构建：主体（分隔条 + 表格 + 分析）----------------
@@ -411,11 +564,25 @@ class EventLogPanel(QWidget):
         self.progress.setVisible(False)
         main.addWidget(self.progress)
 
-        split = QSplitter(Qt.Orientation.Vertical)
+        # 开机 / 运行时长摘要条：仅当取回的日志里含开机类事件时显示（见 _update_boot_line）
+        self.boot_lbl = QLabel("")
+        self.boot_lbl.setWordWrap(True)
+        self.boot_lbl.setStyleSheet(BOOT_LINE_QSS)
+        self.boot_lbl.setVisible(False)
+        main.addWidget(self.boot_lbl)
+
+        self.split = QSplitter(Qt.Orientation.Vertical)
+        split = self.split
+        # 分隔条加宽 + 悬停高亮，并禁止把任一侧拖成 0：
+        # 原来的手柄只有 1px 且无视觉提示，用户根本不知道这里可以拖拽。
+        split.setHandleWidth(9)
+        split.setChildrenCollapsible(False)
+        split.setStyleSheet(SPLIT_HANDLE_QSS)
 
         # ---- 上：列表 + 分页 ----
         top = QWidget()
         tv = QVBoxLayout(top)
+        tv.setContentsMargins(0, 0, 0, 0)
         tv.setSpacing(4)
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(["时间", "来源", "事件ID", "级别", "描述"])
@@ -425,7 +592,12 @@ class EventLogPanel(QWidget):
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setWordWrap(False)
+        # 列表最小高度：统计区被拖大时，日志详情也至少能看到约 6 行
+        self.table.setMinimumHeight(LIST_MIN_H)
+        self._base_font_pt = self.table.font().pointSize()    # A- / A+ 的字号基准
+        self._font_step = 0
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_table_menu)
         self.table.cellDoubleClicked.connect(
             lambda r, c: self._show_detail(r))
         hh = self.table.horizontalHeader()
@@ -465,6 +637,26 @@ class EventLogPanel(QWidget):
         pg.addWidget(self.page_size_cb)
         pg.addWidget(QLabel("条"))
         pg.addStretch(1)
+        # 布局 / 缩放控件放在列表正下方、紧邻分隔条：语义直观，也不额外占一整行
+        self.lbl_split_hint = QLabel("↕ 拖动分隔条可调整上下比例")
+        self.lbl_split_hint.setStyleSheet("color:#9ca3af;")
+        pg.addWidget(self.lbl_split_hint)
+        self.btn_analysis_toggle = QPushButton("收起统计区")
+        self.btn_analysis_toggle.setToolTip(
+            "折叠下方统计与分析区，把整个高度让给日志列表（再次点击还原）")
+        self.btn_analysis_toggle.clicked.connect(self._toggle_analysis)
+        pg.addWidget(self.btn_analysis_toggle)
+        pg.addWidget(QLabel("列表字号："))
+        self.btn_font_minus = QPushButton("A-")
+        self.btn_font_plus = QPushButton("A+")
+        for b, tip in ((self.btn_font_minus, "缩小日志列表字号"),
+                       (self.btn_font_plus, "放大日志列表字号（长描述更易读）")):
+            b.setFixedWidth(34)
+            b.setToolTip(tip)
+        self.btn_font_minus.clicked.connect(lambda: self._zoom_list(-1))
+        self.btn_font_plus.clicked.connect(lambda: self._zoom_list(+1))
+        pg.addWidget(self.btn_font_minus)
+        pg.addWidget(self.btn_font_plus)
         tv.addLayout(pg)
         split.addWidget(top)
 
@@ -499,15 +691,45 @@ class EventLogPanel(QWidget):
         t2.addWidget(self.src_table, 1)
         self.analysis.addTab(tab2, "趋势与来源")
 
+        self.analysis.setMinimumHeight(ANALYSIS_MIN_H)
         split.addWidget(self.analysis)
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
+        split.setSizes(list(SPLIT_INIT))    # 初始比例明确偏向列表（原来交给 sizeHint 猜）
         main.addWidget(split, 1)
         main.addWidget(self.status)
 
     def _build_status(self):
         # 状态标签已在 __init__ 创建、在 _build_body 末尾加入布局；这里仅设初始文案。
         self.status.setText("点击「查询 / 刷新」加载所选日志通道。")
+
+    # ---------------- 布局：分隔条 / 折叠统计区 / 列表字号 ----------------
+    def _toggle_analysis(self):
+        """折叠 / 展开下方统计区：折叠后整个高度让给日志列表（详情一屏看的行数更多）。
+
+        用「隐藏控件」而不是「把分隔条拖到 0」：后者会被最小高度挡住，做不到真正折叠。
+        """
+        if self.analysis.isVisible():
+            self._analysis_sizes = self.split.sizes()    # 记住折叠前的比例
+            self.analysis.setVisible(False)
+            self.btn_analysis_toggle.setText("展开统计区")
+            self.lbl_split_hint.setVisible(False)
+        else:
+            self.analysis.setVisible(True)
+            self.split.setSizes(self._analysis_sizes or list(SPLIT_INIT))
+            self.btn_analysis_toggle.setText("收起统计区")
+            self.lbl_split_hint.setVisible(True)
+
+    def _zoom_list(self, step: int):
+        """A- / A+ 调整日志列表字号；行高同步放大，避免放大后文字被压扁。"""
+        cur = LIST_FONT_STEPS.index(self._font_step) if self._font_step in LIST_FONT_STEPS else 0
+        cur = max(0, min(len(LIST_FONT_STEPS) - 1, cur + step))
+        self._font_step = LIST_FONT_STEPS[cur]
+        pt = max(6, self._base_font_pt + self._font_step)
+        f = self.table.font(); f.setPointSize(pt)
+        self.table.setFont(f)
+        self.table.verticalHeader().setDefaultSectionSize(max(22, int(pt * 1.95)))
+        self.status.setText(f"列表字号 {pt}pt（A- / A+ 可继续调整）")
 
     # ---------------- 时间范围解析 ----------------
     def _time_range_from_ui(self):
@@ -599,6 +821,7 @@ class EventLogPanel(QWidget):
         self._fill_analysis()
         self._loaded_once = True
         self._update_status()
+        self._update_boot_line()
 
     def _on_error(self, title: str, msg: str):
         self._loading = False
@@ -706,13 +929,20 @@ class EventLogPanel(QWidget):
             row = self.table.rowCount()
             self.table.insertRow(row)
             lv = rec.get("level", "信息")
+            # 开机类事件（6013/6005/12/13…）没有本地化消息，原始描述只是
+            # 「参数N = 值」；这里补一句人话前缀，让「已运行 7586 秒（≈2 小时 6 分）」
+            # 这类信息在列表里就能直接读懂。
+            btext = evs.boot_kind_text(rec)
+            desc = _clip(rec.get("description", ""), 56 if btext else 80)
+            if btext:
+                desc = f"【{btext}】{desc}"
             cells = [
                 (rec.get("time", ""), "time"),
                 (rec.get("source", ""), "source"),
                 (str(rec.get("event_id")) if rec.get("event_id") is not None else "",
                  "event_id"),
                 (lv, "level"),
-                (_clip(rec.get("description", ""), 80), "description"),
+                (desc, "description"),
             ]
             for col, (text, _k) in enumerate(cells):
                 it = QTableWidgetItem(str(text))
@@ -786,11 +1016,45 @@ class EventLogPanel(QWidget):
                     return
 
     # ---------------- 详情 ----------------
-    def _show_detail(self, row: int):
+    def _rec_of_row(self, row: int) -> dict | None:
+        """取某行绑定的整条记录（填充时存在各列第 0 列的 UserRole 里）。"""
         it = self.table.item(row, 0)
-        rec = it.data(Qt.ItemDataRole.UserRole) if it else None
+        return it.data(Qt.ItemDataRole.UserRole) if it else None
+
+    def _show_detail(self, row: int):
+        rec = self._rec_of_row(row)
         if rec is not None:
             self._open_detail(rec)
+
+    def _on_table_menu(self, pos):
+        """列表右键菜单：查看详情 / 复制描述 / 复制原始 XML。
+
+        此前只设了 ContextMenuPolicy.CustomContextMenu 却没有接处理函数，
+        右键毫无反应（等于死代码），这里补上，给详情多一条入口。
+        """
+        row = self.table.rowAt(pos.y())
+        if row < 0:
+            return
+        self.table.selectRow(row)
+        menu = QMenu(self)
+        act_detail = menu.addAction("查看详情（可放大 / 最大化）")
+        act_desc = menu.addAction("复制描述")
+        act_xml = menu.addAction("复制原始 XML")
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        rec = self._rec_of_row(row) or {}
+        if chosen is act_detail:
+            self._show_detail(row)
+        elif chosen is act_desc:
+            self._copy_text(rec.get("description", ""))
+        elif chosen is act_xml:
+            self._copy_text(rec.get("xml", ""))
+
+    @staticmethod
+    def _copy_text(text: str):
+        try:
+            QApplication.clipboard().setText(text or "")
+        except Exception:
+            pass
 
     def _open_detail(self, rec: dict):
         EventDetailDialog(self, rec).exec()
@@ -839,6 +1103,25 @@ class EventLogPanel(QWidget):
             base += f" · 用时 {meta.get('elapsed', 0):.1f}s"
         self.status.setText(base)
         self.status.setStyleSheet("color:#6b7280;")
+
+    def _update_boot_line(self):
+        """刷新「开机 / 运行时长」摘要条。
+
+        只有当当前结果里真的含开机类事件（System 通道 6005/6013/12/13 等，或用户
+        点了「开机与运行」）时才显示，平时不占用界面高度。
+        """
+        try:
+            s = evs.boot_summary(self._all)
+        except Exception:                       # 摘要失败绝不影响日志浏览
+            s = {"available": False}
+        if not s.get("available"):
+            self.boot_lbl.setText("")
+            self.boot_lbl.setVisible(False)
+            return
+        self.boot_lbl.setText("⏱ " + (s.get("summary") or ""))
+        self.boot_lbl.setToolTip("来源：System 通道的 EventLog 6005/6006/6013、"
+                                 "Kernel-General 12/13、User32 1074 等事件")
+        self.boot_lbl.setVisible(True)
 
     # ---------------- 首次显示时自动加载一次 ----------------
     def showEvent(self, ev):

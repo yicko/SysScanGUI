@@ -305,12 +305,14 @@ def parse_event_xml(xml: str) -> dict:
       record_id   事件记录 ID
       keywords    关键字（原始 0x... 串）
       description 可读描述（优先 RenderingInfo/Message，否则事件数据拼接）
+      event_data  结构化事件数据 {字段: 值}（无名 Data 记为 参数1..N，保留位置）
       xml         原始 XML
     """
     rec: dict = {
         "time": "", "time_iso": "", "ts": None, "source": "", "event_id": None,
         "level": "信息", "level_num": 4, "channel": "", "computer": "",
-        "record_id": None, "keywords": "", "description": "", "xml": xml,
+        "record_id": None, "keywords": "", "description": "", "event_data": {},
+        "xml": xml,
     }
     try:
         root = ET.fromstring(xml)
@@ -408,6 +410,10 @@ def parse_event_xml(xml: str) -> dict:
         rec["description"] = "\n".join(f"{k} = {v}" for k, v in pairs)
     else:
         rec["description"] = "(无附加数据)"
+    # 结构化事件数据 {字段: 值}。无名 <Data> 已按位置命名为「参数1..N」，位置信息
+    # 因此得以保留，上层可据此做非文本判定（例如 6013 的第 5 个字段 = 已运行秒数、
+    # Kernel-General 12 的 StartTime = 开机时刻），不必去解析 description 文本。
+    rec["event_data"] = {k: v for k, v in pairs}
     return rec
 
 

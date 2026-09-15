@@ -4,10 +4,11 @@
 分层验证：
   A. 数据读取层(eventlog_reader)：build_xpath 构造、parse_event_xml 解析
      —— 纯函数，不依赖 PySide6，用受管 Python 即可跑。
-  B. 分析统计层(eventlog_stats)：级别分布/高频错误/时间分桶聚合
-     —— 同样纯函数。
+  B. 分析统计层(eventlog_stats)：级别分布/高频错误/时间分桶聚合，
+     以及开机/关机/运行时长摘要（boot_summary）—— 同样纯函数。
   C. 界面展示层(eventlog_widget) + gui 集成：仅在 PySide6 可用时跑（offscreen），
-     用合成数据驱动面板，验证分页/关键字筛选/排序/分析/导出，以及新增标签页
+     用合成数据驱动面板，验证分页/关键字筛选/排序/分析/导出、详情区布局与
+     缩放交互（分隔条 / 收起统计区 / 字号 / 右键菜单），以及新增标签页
      不会污染既有数据页的索引逻辑(_tab_at)。
 
 运行：python check_eventlog.py
@@ -104,6 +105,11 @@ def test_reader():
     check("解析 ts 非空", rec["ts"] is not None, str(rec["ts"]))
     check("解析 record_id", rec["record_id"] == 12345, str(rec["record_id"]))
     check("解析 channel", rec["channel"] == "Application", rec["channel"])
+    # 结构化事件数据：有名 Data 用其 Name，无名 Data 记 参数1..N（保留位置信息，
+    # 供上层做非文本判定，例如 6013 的第 5 个字段 = 已运行秒数）
+    ed = rec.get("event_data") or {}
+    check("解析 event_data(有名+位置)",
+          ed.get("param1") == "value1" and ed.get("参数1") == "positional", str(ed))
 
     # 无 RenderingInfo 时退回 EventData 拼接
     xml2 = (
@@ -186,6 +192,77 @@ def test_stats():
 
 
 # ==========================================================================
+# B2. 开机 / 关机 / 运行时长（纯函数）
+# ==========================================================================
+def _mk_boot_rec(ts, source, eid, event_data=None, time_str="2026-09-01 00:00:00"):
+    r = _mk_rec(ts, "信息", eid, source)
+    r["time"] = time_str
+    r["event_data"] = event_data or {}
+    r["description"] = "参数1 = \n参数2 = \n参数3 = \n参数4 = \n参数5 = 10"
+    return r
+
+
+def test_boot_stats():
+    section("B2. 开机/关机/运行时长 eventlog_stats.boot_summary")
+    import eventlog_stats as evs
+    from datetime import datetime
+
+    base = datetime(2026, 9, 1, 8, 0, 0).timestamp()
+    recs = [
+        _mk_boot_rec(base, "EventLog", 6005, time_str="2026-09-01 08:00:00"),
+        _mk_boot_rec(base + 10, "EventLog", 6013, {"参数5": "10"},
+                     time_str="2026-09-01 08:00:10"),
+        _mk_boot_rec(base + 86400 * 3, "EventLog", 6013, {"参数5": "259200"},
+                     time_str="2026-09-04 08:00:00"),
+        _mk_boot_rec(base + 90000, "Microsoft-Windows-Kernel-General", 13,
+                     {"StopTime": "2026-09-02T00:00:00Z"},
+                     time_str="2026-09-02 09:00:00"),
+        _mk_boot_rec(base + 95000, "User32", 1074, time_str="2026-09-02 10:23:20"),
+        _mk_rec(base + 96000, "信息", 9999, "SrvX", "普通事件"),
+    ]
+    s = evs.boot_summary(recs, now=datetime.fromtimestamp(base + 95000))
+    check("boot_summary 可用", s["available"], str(s["available"]))
+    check("最近开机 = EventLog 6005",
+          s["last_boot"] and s["last_boot"]["event_id"] == 6005, str(s["last_boot"]))
+    check("最近关机 = Kernel-General 13",
+          s["last_shutdown"] and s["last_shutdown"]["event_id"] == 13,
+          str(s["last_shutdown"]))
+    check("关机晚于开机 → running=False", s["running"] is False, str(s["running"]))
+    check("自报运行时长取最新的 6013", s["uptime_seconds"] == 259200,
+          str(s["uptime_seconds"]))
+    check("关机/重启请求单独归类", len(s["requests"]) == 1, str(len(s["requests"])))
+    check("普通事件不算开机类", evs.boot_event_kind(recs[-1]) is None,
+          str(evs.boot_event_kind(recs[-1])))
+    check("摘要含「最近开机」", "最近开机" in s["summary"], s["summary"])
+
+    # 只有开机、没有关机 → 正在运行，并推断出「本次已运行」
+    s2 = evs.boot_summary(recs[:2], now=datetime.fromtimestamp(base + 3600))
+    check("仅开机 → running=True", s2["running"] is True, str(s2["running"]))
+    check("推断本次已运行=3600s", s2["current_uptime_seconds"] == 3600,
+          str(s2["current_uptime_seconds"]))
+
+    check("空输入安全", evs.boot_summary([])["available"] is False)
+    check("fmt_duration(3天4小时)",
+          evs.fmt_duration(86400 * 3 + 14400) == "3 天 4 小时",
+          evs.fmt_duration(86400 * 3 + 14400))
+    check("fmt_duration 非法输入→空串", evs.fmt_duration("abc") == "",
+          evs.fmt_duration("abc"))
+    check("parse_uptime_seconds 非 6013 → None",
+          evs.parse_uptime_seconds(recs[0]) is None)
+    check("parse_uptime_seconds 非数字 → None",
+          evs.parse_uptime_seconds(_mk_boot_rec(base, "EventLog", 6013,
+                                                {"参数5": "x"})) is None)
+    check("boot_kind_text(6013) 是可读人话",
+          "已运行 259200 秒" in evs.boot_kind_text(recs[2]),
+          evs.boot_kind_text(recs[2]))
+    check("boot_kind_text(普通事件)=空串", evs.boot_kind_text(recs[-1]) == "",
+          evs.boot_kind_text(recs[-1]))
+    check("快捷筛选清单不缺 6013/12",
+          6013 in evs.BOOT_FILTER_EVENT_IDS and 12 in evs.BOOT_FILTER_EVENT_IDS,
+          str(evs.BOOT_FILTER_EVENT_IDS))
+
+
+# ==========================================================================
 # C. 界面层 + gui 集成（仅 PySide6 可用时）
 # ==========================================================================
 def test_ui():
@@ -210,6 +287,12 @@ def test_ui():
     # --- 构造函数不触发读盘 ---
     panel = evw.EventLogPanel()
     check("面板构造不卡死", panel is not None)
+    # offscreen 下也要给面板真实尺寸，几何/分隔条相关断言才有意义；
+    # 先置 _loaded_once，避免 show() 触发 showEvent 里的「首次自动读盘」
+    panel._loaded_once = True
+    panel.resize(1100, 760)
+    panel.show()
+    app.processEvents()
 
     # --- 注入合成数据，驱动内部流程 ---
     from datetime import datetime, timezone, timedelta
@@ -280,9 +363,163 @@ def test_ui():
     else:
         check("CSV 已写出", False, tmp)
 
-    # 详情对话框可构造
-    dlg = evw.EventDetailDialog(panel, recs[0])
+    # ================= 详情区布局与交互（本次优化重点）=================
+    from PySide6.QtCore import Qt as Q, QPoint
+    evw.QMessageBox.warning = lambda *a, **k: None
+
+    panel._apply_client_filter()
+    panel._page = 0
+    panel._fill_page()
+    app.processEvents()
+
+    sp = panel.split
+    check("分隔条加宽可抓(9px)", sp.handleWidth() == 9, str(sp.handleWidth()))
+    check("分隔条禁止把某侧拖成 0", sp.childrenCollapsible() is False,
+          str(sp.childrenCollapsible()))
+    sizes = sp.sizes()
+    check("初始比例偏向日志列表", len(sizes) == 2 and sizes[0] > sizes[1], str(sizes))
+    check("列表有最小高度(不会被压成两行)",
+          panel.table.minimumHeight() == evw.LIST_MIN_H,
+          str(panel.table.minimumHeight()))
+
+    # 收起 / 展开统计区（把高度让给日志列表）
+    panel.analysis.setVisible(True)
+    panel._toggle_analysis()
+    check("收起统计区 → 分析区隐藏", not panel.analysis.isVisible())
+    check("收起后按钮文案=展开统计区",
+          panel.btn_analysis_toggle.text() == "展开统计区",
+          panel.btn_analysis_toggle.text())
+    panel._toggle_analysis()
+    check("再次点击 → 分析区显示", panel.analysis.isVisible())
+    check("展开后按钮文案复原", panel.btn_analysis_toggle.text() == "收起统计区",
+          panel.btn_analysis_toggle.text())
+
+    # 列表字号缩放（A- / A+）
+    pt0 = panel.table.font().pointSize()
+    panel._zoom_list(+1)
+    pt1 = panel.table.font().pointSize()
+    check("A+ 放大列表字号", pt1 > pt0, f"{pt0} -> {pt1}")
+    panel._zoom_list(-1)
+    check("A- 复原字号", panel.table.font().pointSize() == pt0,
+          str(panel.table.font().pointSize()))
+    for _ in range(20):
+        panel._zoom_list(-1)                 # 触到档位边界不应异常/越界
+    check("字号有下限保护", panel.table.font().pointSize() >= 6,
+          str(panel.table.font().pointSize()))
+
+    # 右键菜单：此前只设了 ContextMenuPolicy 却没有接处理函数（死代码）
+    class _FakeMenu:
+        def __init__(self, *a, **k):
+            pass
+
+        def addAction(self, *a, **k):
+            return object()
+
+        def exec(self, *a, **k):
+            return None
+
+    real_menu = evw.QMenu
+    evw.QMenu = _FakeMenu
+    try:
+        y = panel.table.rowViewportPosition(1) + 2
+        row_hit = panel.table.rowAt(y)
+        check("表格行命中测试可用", row_hit >= 0, str(row_hit))
+        panel.table.clearSelection()
+        panel.table.customContextMenuRequested.emit(QPoint(5, y))
+        check("右键菜单已接上处理函数（命中行被选中）",
+              panel.table.currentRow() == row_hit, str(panel.table.currentRow()))
+    finally:
+        evw.QMenu = real_menu
+
+    rec0 = panel._rec_of_row(0)
+    check("_rec_of_row 取回整条记录",
+          isinstance(rec0, dict) and "source" in rec0, str(type(rec0)))
+    panel._copy_text("剪贴板测试")
+    check("复制到剪贴板可用", QApplication.clipboard().text() == "剪贴板测试",
+          QApplication.clipboard().text())
+
+    # 详情对话框：可放大 + 三块可拖拽 + 字号缩放
+    boot_rec = _mk_boot_rec(base, "EventLog", 6013, {"参数5": "7586"},
+                            time_str="2026-09-01 08:00:10")
+    dlg = evw.EventDetailDialog(panel, boot_rec)
     check("详情对话框构造成功", dlg is not None)
+    check("详情对话框可最大化",
+          bool(dlg.windowFlags() & Q.WindowType.WindowMaximizeButtonHint),
+          str(dlg.windowFlags()))
+    check("详情对话框带拉伸手柄", dlg.isSizeGripEnabled(),
+          str(dlg.isSizeGripEnabled()))
+    dsp = dlg.findChild(evw.QSplitter)
+    check("详情内三块由分隔条分隔",
+          dsp is not None and dsp.count() == 3, str(dsp.count() if dsp else None))
+    check("详情分隔条同样禁止拖成 0",
+          dsp is not None and dsp.childrenCollapsible() is False)
+    check("描述不再被限高（原来 max 140px）", dlg.desc.maximumHeight() >= 10000,
+          str(dlg.desc.maximumHeight()))
+    check("开机事件详情里有「事件含义」行",
+          any(dlg.fields.item(r, 0) and dlg.fields.item(r, 0).text() == "事件含义"
+              for r in range(dlg.fields.rowCount())))
+    pt_b = dlg.desc.font().pointSize()
+    dlg._zoom(+1)
+    check("详情 A+ 放大正文字号", dlg.desc.font().pointSize() > pt_b,
+          f"{pt_b} -> {dlg.desc.font().pointSize()}")
+    dlg._zoom(-1)
+    check("详情 A- 复原字号", dlg.desc.font().pointSize() == pt_b,
+          str(dlg.desc.font().pointSize()))
+    dlg.resize(880, 600)
+    dlg.done(0)
+    check("详情窗口尺寸被记住", evw.EventDetailDialog._last_size is not None,
+          str(evw.EventDetailDialog._last_size))
+    dlg2 = evw.EventDetailDialog(panel, boot_rec)
+    check("下次打开沿用记忆尺寸", dlg2.size().width() == 880, str(dlg2.size()))
+
+    # ================= 「开机与运行」：列表可读前缀 + 摘要条 + 一键预设 =========
+    boot_6005 = _mk_boot_rec(base, "EventLog", 6005, time_str="2026-09-01 08:00:00")
+    panel._fetched = [boot_rec, boot_6005]
+    panel._meta = {"truncated": False, "max_records": 5000, "elapsed": 0.1,
+                   "channel": "System"}
+    panel._apply_client_filter()
+    panel._page = 0
+    panel._fill_page()
+    # 不依赖排序顺序（此前的排序测试把排序留在了「事件ID 升序」），扫描整页
+    cells = [(panel.table.item(r, 4).text() if panel.table.item(r, 4) else "")
+             for r in range(panel.table.rowCount())]
+    check("开机类记录在列表中带可读前缀（6013→已运行）",
+          any("【系统已运行 7586 秒" in c for c in cells), str(cells))
+    check("开机类记录在列表中带可读前缀（6005→开机）",
+          any("【开机" in c for c in cells), str(cells))
+    panel._update_boot_line()
+    check("开机摘要条显示且有内容",
+          panel.boot_lbl.isVisible() and "最近开机" in panel.boot_lbl.text()
+          and "已运行" in panel.boot_lbl.text(), panel.boot_lbl.text())
+
+    panel._fetched = recs                    # 换回普通日志 → 摘要条应自动隐藏
+    panel._apply_client_filter()
+    panel._page = 0
+    panel._fill_page()
+    panel._update_boot_line()
+    check("普通日志不显示开机摘要条", not panel.boot_lbl.isVisible(),
+          panel.boot_lbl.text())
+
+    calls = []                               # 预设按钮：只验证筛选条件，不真读盘
+    real_run = panel.run_query
+    panel.run_query = lambda: calls.append(1)
+    try:
+        panel._preset_boot()
+    finally:
+        panel.run_query = real_run
+    check("预设切到 System 通道", panel.channel_cb.currentText() == "System",
+          panel.channel_cb.currentText())
+    check("预设填入开机相关来源",
+          "EventLog" in panel.src_edit.text()
+          and "Kernel-General" in panel.src_edit.text(), panel.src_edit.text())
+    check("预设填入 6013/6005 等事件ID",
+          "6013" in panel.eid_edit.text() and "6005" in panel.eid_edit.text(),
+          panel.eid_edit.text())
+    check("预设时间范围=近30天", panel.time_cb.currentText() == "近30天",
+          panel.time_cb.currentText())
+    check("预设不勾掉任何级别（开机日志多为「信息」）",
+          all(cb.isChecked() for cb in panel.level_boxes.values()))
+    check("预设触发了一次查询", len(calls) == 1, str(len(calls)))
 
     # --- gui 集成：新增标签页不污染既有索引逻辑 ---
     check("gui 已导入", gui_mod is not None)
@@ -303,6 +540,7 @@ def test_ui():
 def main():
     test_reader()
     test_stats()
+    test_boot_stats()
     test_ui()
 
     print("\n================ 结果 ================")

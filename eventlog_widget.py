@@ -22,9 +22,19 @@
 筛选的两段式（兼顾快与灵活）
 ────────────────────────────────────────────────────────────────────────
 - 结构性筛选（通道 / 级别 / 时间 / 事件ID / 来源）走 XPath 在服务端做，
-  「查询」按钮才会触发重新读取；XPath 表达不了的全字段模糊匹配（关键字）
-  在已取回的数据上客户端秒筛，输入即过滤、不碰磁盘。
+  改完由「自动刷新」防抖后重新读取（也可取消勾选「自动刷新」回到手动
+  「查询 / 刷新」）；XPath 表达不了的全字段模糊匹配（关键字）在已取回的
+  数据上客户端秒筛，输入即过滤、不碰磁盘。
 - 这样「级别/时间」等重筛选是快且省内存的；「关键字」是即时、无感的。
+
+────────────────────────────────────────────────────────────────────────
+自动刷新（防抖 + 排队）
+────────────────────────────────────────────────────────────────────────
+筛选项一变就立刻读盘会「抖」：一次点击、一次输入都会连发多个信号。所以：
+- 所有服务端筛选项变更只启动一个单次定时器(_auto_timer)，连续变更被合并成一次查询；
+- 读盘途中又改筛选不会被丢掉，记 _pending_auto，读完立刻按最新条件补查一次；
+- 程序化回填（重置筛选 / 开机与运行预设）期间 _suppress_auto > 0，不触发自动刷新，
+  由调用方在最后统一发起一次查询，避免「填 5 个字段查 5 次」。
 """
 
 from __future__ import annotations
@@ -33,7 +43,7 @@ import csv
 import json
 from datetime import datetime, timedelta
 
-from PySide6.QtCore import Qt, QThread, Signal, QSize, QDateTime
+from PySide6.QtCore import Qt, QThread, Signal, QSize, QDateTime, QTimer
 from PySide6.QtGui import (QColor, QBrush, QFont, QPainter, QPen, QPalette,
                            QShortcut, QKeySequence)
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
@@ -59,6 +69,16 @@ LEVEL_FG = {
 LEVEL_SEVERITY = {"严重": 0, "错误": 1, "警告": 2, "信息": 3, "详细": 4}
 
 TIME_PRESETS = ["全部", "近1小时", "近24小时", "近7天", "近30天", "自定义"]
+
+# --------------------------------------------------------------------------
+# 筛选条件变更 → 自动重新查询（防抖合并）
+# --------------------------------------------------------------------------
+# 通道/级别/时间/事件ID/来源是「服务端(XPath)筛选」，改了必须重新读盘才能生效。
+# 下拉框、复选框是「一次点击定一个值」，短延时即可；文本框、时间框会逐字符、
+# 逐次步进地发信号，用长延时把连续输入合并成一次查询——否则输入「6005」会被
+# 拆成 6 / 60 / 600 / 6005 四次读盘（每次都可能是几千条日志，白等）。
+AUTO_DEBOUNCE_PICK_MS = 350         # 下拉/复选框：点完就刷
+AUTO_DEBOUNCE_TYPE_MS = 900         # 文本框/时间框：停止输入再刷
 
 PAGE_SIZE_DEFAULT = 200
 
@@ -389,6 +409,17 @@ class EventLogPanel(QWidget):
         self._font_step = 0                              # 列表字号档位（A- / A+）
         self._base_font_pt = 0                           # 由 _build_body 取列表默认字号
 
+        # 自动刷新（筛选变更 → 防抖后重新读盘）
+        # 必须早于 _build_filter_bar()：构建时 setCurrentText/setChecked 就会发信号，
+        # 对应的处理函数要能拿到定时器。
+        self._auto_refresh = True                        # 「自动刷新」开关（默认开）
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setSingleShot(True)
+        self._auto_timer.timeout.connect(self._auto_query)
+        self._suppress_auto = 0                          # >0 = 正在程序化回填筛选控件
+        self._pending_auto = False                       # 读盘途中又改筛选 → 读完补查
+        self._auto_triggered = False                     # 本次读盘是否由自动刷新发起
+
         # 状态标签必须先于 _build_body 创建（主体布局末尾会引用它）
         self.status = QLabel("点击「查询 / 刷新」加载所选日志通道。")
         self.status.setStyleSheet("color:#6b7280;")
@@ -408,6 +439,8 @@ class EventLogPanel(QWidget):
         self.channel_cb = QComboBox()
         self.channel_cb.addItems(evr.DEFAULT_CHANNELS)
         self.channel_cb.setFixedWidth(280)
+        # 通道是 XPath 的查询参数，改了必须重新读盘
+        self.channel_cb.currentTextChanged.connect(self._on_filter_changed)
         row1.addWidget(self.channel_cb)
 
         row1.addWidget(QLabel("级别："))
@@ -415,6 +448,7 @@ class EventLogPanel(QWidget):
         for lv in ["信息", "警告", "错误", "严重", "详细"]:
             cb = QCheckBox(lv)
             cb.setChecked(True)
+            cb.stateChanged.connect(self._on_filter_changed)
             self.level_boxes[lv] = cb
             row1.addWidget(cb)
         self.btn_level_all = QPushButton("全选")
@@ -443,6 +477,7 @@ class EventLogPanel(QWidget):
             dt.setCalendarPopup(True)
             dt.setFixedWidth(150)
             dt.setEnabled(False)           # 仅「自定义」时可用
+            dt.dateTimeChanged.connect(self._on_datetime_changed)
         row2.addWidget(self.dt_from)
         row2.addWidget(QLabel("至"))
         row2.addWidget(self.dt_to)
@@ -451,12 +486,14 @@ class EventLogPanel(QWidget):
         self.eid_edit = QLineEdit()
         self.eid_edit.setPlaceholderText("逗号分隔，如 1001,1000")
         self.eid_edit.setFixedWidth(160)
+        self.eid_edit.textChanged.connect(self._on_filter_text_changed)
         row2.addWidget(self.eid_edit)
 
         row2.addWidget(QLabel("来源："))
         self.src_edit = QLineEdit()
         self.src_edit.setPlaceholderText("逗号分隔 Provider 名")
         self.src_edit.setFixedWidth(180)
+        self.src_edit.textChanged.connect(self._on_filter_text_changed)
         row2.addWidget(self.src_edit)
         row2.addStretch(1)
         lay.addLayout(row2)
@@ -472,9 +509,21 @@ class EventLogPanel(QWidget):
         self.max_spin.addItems(["1000", "5000", "20000", "50000"])
         self.max_spin.setCurrentText("5000")
         self.max_spin.setFixedWidth(90)
+        self.max_spin.currentTextChanged.connect(self._on_filter_changed)
         row3.addWidget(QLabel("最多取回："))
         row3.addWidget(self.max_spin)
         row3.addWidget(QLabel("条"))
+
+        self.auto_cb = QCheckBox("自动刷新")
+        self.auto_cb.setChecked(True)
+        self.auto_cb.setToolTip(
+            "改「通道 / 级别 / 时间范围 / 事件ID / 来源 / 最多取回」后自动重新读取：\n"
+            f"下拉与复选框点完约 {AUTO_DEBOUNCE_PICK_MS / 1000:.1f} 秒生效，"
+            f"输入框/时间框停止输入约 {AUTO_DEBOUNCE_TYPE_MS / 1000:.1f} 秒生效。\n"
+            "「关键字」始终是输入即时过滤（不读盘）。\n"
+            "取消勾选即回到手动：「查询 / 刷新」按钮。")
+        self.auto_cb.toggled.connect(self._on_auto_toggled)
+        row3.addWidget(self.auto_cb)
 
         self.btn_query = QPushButton("▶ 查询 / 刷新")
         self.btn_query.clicked.connect(self.run_query)
@@ -507,13 +556,68 @@ class EventLogPanel(QWidget):
         self._filter_layout = outer
 
     def _set_levels(self, on: bool):
-        for cb in self.level_boxes.values():
-            cb.setChecked(on)
+        self._suppress_auto += 1            # 5 个复选框的连发只算「一次」变更
+        try:
+            for cb in self.level_boxes.values():
+                cb.setChecked(on)
+        finally:
+            self._suppress_auto -= 1
+        self._schedule_auto()
 
     def _on_time_preset(self, text: str):
         custom = text == "自定义"
         self.dt_from.setEnabled(custom)
         self.dt_to.setEnabled(custom)
+        self._schedule_auto()
+
+    def _on_datetime_changed(self, *_):
+        # 只有「自定义」时这两个控件才可用；改动即重新读盘（长延时合并连续步进）
+        self._schedule_auto(AUTO_DEBOUNCE_TYPE_MS)
+
+    # ---------------- 筛选变更 → 自动刷新（防抖 + 排队）----------------
+    def _on_filter_changed(self, *_):
+        """离散控件（下拉框 / 复选框）变更：点完很快就刷新。"""
+        self._schedule_auto(AUTO_DEBOUNCE_PICK_MS)
+
+    def _on_filter_text_changed(self, *_):
+        """文本类筛选（事件ID / 来源）：把连续输入合并成一次读盘。"""
+        self._schedule_auto(AUTO_DEBOUNCE_TYPE_MS)
+
+    def _schedule_auto(self, delay: int = AUTO_DEBOUNCE_PICK_MS):
+        """登记一次「筛选变了」。连续变更共享同一个单次定时器 → 只查一次。"""
+        if self._suppress_auto or not self._auto_refresh:
+            return
+        self._auto_timer.start(delay)
+
+    def _auto_query(self):
+        """防抖到点：真正发起查询。读盘途中就排队，读完立即按最新条件补一次。"""
+        if not self._auto_refresh or self._suppress_auto:
+            return
+        if self._loading:
+            self._pending_auto = True
+            return
+        self._auto_triggered = True
+        self.run_query()
+
+    def _resume_pending_auto(self):
+        """一次读盘结束后，若期间筛选又变过，立即再查一次（不丢用户的操作）。"""
+        if not self._pending_auto:
+            return
+        self._pending_auto = False
+        if self._auto_refresh:
+            self._auto_timer.start(0)
+
+    def _on_auto_toggled(self, on: bool):
+        self._auto_refresh = bool(on)
+        if not on:
+            self._auto_timer.stop()
+            self._pending_auto = False
+            self.status.setText("已关闭自动刷新：改完筛选请点「▶ 查询 / 刷新」。")
+            self.status.setStyleSheet("color:#6b7280;")
+            return
+        self.status.setText("已开启自动刷新：筛选条件变更后会自动重新查询。")
+        self.status.setStyleSheet("color:#6b7280;")
+        self._schedule_auto(0)              # 立刻按当前筛选条件对齐一次
 
     def _on_keyword(self):
         # 关键字只做客户端筛选，不重新读盘：即时、无感
@@ -526,13 +630,19 @@ class EventLogPanel(QWidget):
         self._update_boot_line()
 
     def _reset_filters(self):
-        self.channel_cb.setCurrentIndex(0)
-        self._set_levels(True)
-        self.time_cb.setCurrentText("近24小时")
-        self._on_time_preset("近24小时")
-        self.eid_edit.clear()
-        self.src_edit.clear()
-        self.kw_edit.clear()
+        # 批量回填期间压住自动刷新，最后统一查一次（否则会填 5 个字段查 5 次）
+        self._auto_timer.stop()
+        self._suppress_auto += 1
+        try:
+            self.channel_cb.setCurrentIndex(0)
+            self._set_levels(True)
+            self.time_cb.setCurrentText("近24小时")
+            self._on_time_preset("近24小时")
+            self.eid_edit.clear()
+            self.src_edit.clear()
+            self.kw_edit.clear()
+        finally:
+            self._suppress_auto -= 1
         self.run_query()
 
     def _preset_boot(self):
@@ -542,13 +652,19 @@ class EventLogPanel(QWidget):
         但它们是「信息」级别、混在数千条日志中，手工填来源+事件ID 很麻烦，
         这里把筛选条件（来源 / 事件ID / 时间范围）一次填好并立即查询。
         """
-        self.channel_cb.setCurrentText("System")
-        self._set_levels(True)                    # 开机类事件多为「信息」，级别不能过滤掉
-        self.time_cb.setCurrentText("近30天")
-        self._on_time_preset("近30天")
-        self.src_edit.setText(", ".join(evs.BOOT_FILTER_PROVIDERS))
-        self.eid_edit.setText(", ".join(str(i) for i in evs.BOOT_FILTER_EVENT_IDS))
-        self.kw_edit.clear()
+        # 与「重置筛选」同理：回填 5 个字段期间不自动刷新，最后统一查一次
+        self._auto_timer.stop()
+        self._suppress_auto += 1
+        try:
+            self.channel_cb.setCurrentText("System")
+            self._set_levels(True)                # 开机类事件多为「信息」，级别不能过滤掉
+            self.time_cb.setCurrentText("近30天")
+            self._on_time_preset("近30天")
+            self.src_edit.setText(", ".join(evs.BOOT_FILTER_PROVIDERS))
+            self.eid_edit.setText(", ".join(str(i) for i in evs.BOOT_FILTER_EVENT_IDS))
+            self.kw_edit.clear()
+        finally:
+            self._suppress_auto -= 1
         self.status.setText("已套用「开机与运行」筛选（System 通道 · 开机/关机/运行时长事件）…")
         self.run_query()
 
@@ -822,10 +938,19 @@ class EventLogPanel(QWidget):
         self._loaded_once = True
         self._update_status()
         self._update_boot_line()
+        if self._auto_triggered:                    # 让用户知道「不是我点的查询」
+            self._auto_triggered = False
+            self.status.setText("⟳ 已按新筛选条件自动刷新 · " + self.status.text())
+        self._resume_pending_auto()                 # 读盘途中改过筛选 → 立即补查
 
     def _on_error(self, title: str, msg: str):
         self._loading = False
         self._worker = None
+        # 出错不自动重试（避免对着不可用的通道反复读盘）；排队中的自动刷新一并丢弃，
+        # 用户修正条件后下一次变更仍会自动刷新。
+        self._auto_triggered = False
+        self._pending_auto = False
+        self._auto_timer.stop()
         self.btn_query.setEnabled(True)
         self.btn_query.setText("▶ 查询 / 刷新")
         self.progress.setVisible(False)

@@ -521,6 +521,147 @@ def test_ui():
           all(cb.isChecked() for cb in panel.level_boxes.values()))
     check("预设触发了一次查询", len(calls) == 1, str(len(calls)))
 
+    # ================= 筛选变更 → 自动刷新（防抖 + 排队）=================
+    import time as _time
+    import eventlog_reader as evr
+
+    calls2: list[int] = []
+    real_run2 = panel.run_query
+    panel.run_query = lambda: calls2.append(1)
+
+    def _pump(seconds: float):
+        """在 offscreen 下推进事件循环：定时器靠 processEvents 派发。"""
+        end = _time.time() + seconds
+        while _time.time() < end:
+            app.processEvents()
+            _time.sleep(0.02)
+
+    def _wait_calls(expect: int, timeout: float = 4.0) -> bool:
+        end = _time.time() + timeout
+        while _time.time() < end:
+            app.processEvents()
+            if len(calls2) >= expect:
+                return True
+            _time.sleep(0.02)
+        return False
+
+    def _pick_other_channel() -> str:
+        cur = panel.channel_cb.currentText()
+        return next(c for c in evr.DEFAULT_CHANNELS if c != cur)
+
+    try:
+        check("默认开启自动刷新", panel.auto_cb.isChecked() and panel._auto_refresh)
+
+        # 改「通道」→ 短防抖后自动查询
+        panel._auto_timer.stop()
+        calls2.clear()
+        panel.channel_cb.setCurrentText(_pick_other_channel())
+        check("改通道即启动防抖定时器", panel._auto_timer.isActive())
+        check("离散控件防抖延时=350ms",
+              panel._auto_timer.interval() == evw.AUTO_DEBOUNCE_PICK_MS,
+              str(panel._auto_timer.interval()))
+        check("防抖到点自动发起查询", _wait_calls(1) and len(calls2) == 1,
+              str(len(calls2)))
+        check("自动发起的查询被标记(_auto_triggered)", panel._auto_triggered)
+        panel._auto_triggered = False
+
+        # 连续变更（通道 + 级别 + 时间）应被合并成「一次」查询
+        panel._auto_timer.stop()
+        calls2.clear()
+        panel.channel_cb.setCurrentText(_pick_other_channel())
+        panel.level_boxes["信息"].setChecked(False)
+        panel.level_boxes["信息"].setChecked(True)
+        panel.time_cb.setCurrentText("近7天")
+        _wait_calls(1)
+        _pump(0.8)                                  # 超过防抖窗口再看有没有第二次
+        check("连续变更被合并为一次查询", len(calls2) == 1, str(len(calls2)))
+
+        # 「全选 / 清空」按钮点一下 = 5 个复选框连发，也只能算一次
+        panel._auto_timer.stop()
+        calls2.clear()
+        panel.btn_level_none.click()
+        panel.btn_level_all.click()
+        _wait_calls(1)
+        _pump(0.8)
+        check("级别全选/清空只触发一次查询", len(calls2) == 1, str(len(calls2)))
+
+        # 文本类筛选（事件ID/来源）用更长的防抖，把连续输入合并掉
+        panel._auto_timer.stop()
+        calls2.clear()
+        panel.eid_edit.setText("6")
+        check("文本筛选防抖延时更长=900ms",
+              panel._auto_timer.interval() == evw.AUTO_DEBOUNCE_TYPE_MS,
+              str(panel._auto_timer.interval()))
+        panel.eid_edit.setText("60")
+        panel.eid_edit.setText("6005")               # 逐字符输入只应查最后一次
+        _wait_calls(1)
+        _pump(1.0)
+        check("逐字符输入合并为一次查询", len(calls2) == 1, str(len(calls2)))
+        panel.eid_edit.clear()
+
+        # 读盘途中改筛选 → 记 pending，读完立即按最新条件补一次（不丢用户操作）
+        panel._auto_timer.stop()
+        calls2.clear()
+        panel._loading = True
+        panel._pending_auto = False
+        panel._auto_query()                          # 定时器到点但正在读盘
+        check("读盘途中改筛选进排队(_pending_auto)",
+              panel._pending_auto is True and not calls2, str(len(calls2)))
+        panel._loading = False
+        panel._resume_pending_auto()
+        check("读完补查(pending 清空 + 定时器重启)",
+              panel._pending_auto is False and panel._auto_timer.isActive())
+        check("补查真的执行了", _wait_calls(1) and len(calls2) == 1, str(len(calls2)))
+
+        # 自动刷新完成后的状态栏提示（含 ⟳ 前缀，让用户知道不是自己点的）
+        panel._auto_timer.stop()
+        panel._pending_auto = False
+        panel._auto_triggered = True
+        panel._on_finished([], {"truncated": False, "max_records": 5000,
+                                "elapsed": 0.1, "channel": panel.channel_cb.currentText()})
+        check("自动刷新后状态栏带 ⟳ 提示",
+              "⟳ 已按新筛选条件自动刷新" in panel.status.text(), panel.status.text())
+        check("提示用完即清标记", panel._auto_triggered is False)
+
+        # 关掉开关 → 回到手动，改筛选不再读盘
+        panel._auto_timer.stop()
+        calls2.clear()
+        panel.auto_cb.setChecked(False)
+        check("关闭自动刷新后开关状态生效", panel._auto_refresh is False)
+        check("关闭时状态栏有手动提示", "已关闭自动刷新" in panel.status.text(),
+              panel.status.text())
+        n_before = len(calls2)
+        panel.channel_cb.setCurrentText(_pick_other_channel())
+        panel.time_cb.setCurrentText("近1小时")
+        _pump(0.8)
+        check("关闭后改筛选不自动查询",
+              len(calls2) == n_before and not panel._auto_timer.isActive(),
+              str(len(calls2)))
+
+        # 重新打开 → 立刻按当前筛选条件对齐一次
+        n_before = len(calls2)
+        panel.auto_cb.setChecked(True)
+        check("重新开启立即对齐一次查询", _wait_calls(n_before + 1), str(len(calls2)))
+
+        # 关键字仍然「输入即时、不读盘」
+        panel._auto_timer.stop()
+        calls2.clear()
+        panel.kw_edit.setText("UNIQUETOKEN")
+        _pump(1.0)
+        check("关键字即时过滤不触发读盘", len(calls2) == 0, str(len(calls2)))
+        panel.kw_edit.clear()
+
+        # 程序化回填（重置筛选 / 开机预设）只查一次，不是「填 5 个字段查 5 次」
+        panel._auto_timer.stop()
+        calls2.clear()
+        panel._reset_filters()
+        _pump(0.8)
+        check("重置筛选只触发一次查询", len(calls2) == 1, str(len(calls2)))
+    finally:
+        panel.run_query = real_run2
+        panel._auto_timer.stop()
+        panel._pending_auto = False
+
     # --- gui 集成：新增标签页不污染既有索引逻辑 ---
     check("gui 已导入", gui_mod is not None)
     check("新增了 系统日志 标签页构造逻辑",
